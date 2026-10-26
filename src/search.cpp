@@ -71,9 +71,13 @@ double Control::paused_ms() {
         .count();
 }
 
-// 正式排名（契约 v3）：数量降序 → 距本次搜索中心水平距离平方升序 → X → Z。所有局部/合并/断点/输出共用。
-bool better(const Result &a, const Result &b) {
-    return std::tuple{-a.spawners, a.distance_sq, a.x, a.z} < std::tuple{-b.spawners, b.distance_sq, b.x, b.z};
+// 正式排名（契约 v4）：折算数量降序 → 距本次搜索中心水平距离平方升序 → X → Z。
+// ratio=1.0 时折算数量等于总刷怪笼数，与旧 v3 排序完全一致。
+bool better(const Result &a, const Result &b, double conversion_ratio) {
+    const double ca = converted_spawners(a, conversion_ratio);
+    const double cb = converted_spawners(b, conversion_ratio);
+    if (ca != cb) return ca > cb;
+    return std::tuple{a.distance_sq, a.x, a.z} < std::tuple{b.distance_sq, b.x, b.z};
 }
 
 static uint64_t key(int x, int z) {
@@ -335,9 +339,10 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
 }
 
 // 组容量沿用 ranking_capacity()：旧的固定 100 条上限会让「前 200」在同数量组内提前丢掉仍可能按距离胜出的候选。
-bool Ranking::discard(int count, int upper) const {
+bool Ranking::discard(int count, double upper) const {
     auto it = groups_.find(count);
-    return it != groups_.end() && it->second.size() == capacity_ && upper < it->second.back().spawners;
+    return it != groups_.end() && it->second.size() == capacity_ &&
+           upper < converted_spawners(it->second.back(), conversion_ratio_);
 }
 
 void Ranking::accept(Result result) {
@@ -346,12 +351,15 @@ void Ranking::accept(Result result) {
         return x.structures == result.structures;
     });
     if (duplicate != group.end()) {
-        if (!better(result, *duplicate))
+        if (!better(result, *duplicate, conversion_ratio_))
             return;
         group.erase(duplicate);
-    } else if (group.size() == capacity_ && !better(result, group.back()))
+    } else if (group.size() == capacity_ && !better(result, group.back(), conversion_ratio_))
         return;
-    auto at = std::lower_bound(group.begin(), group.end(), result, better);
+    auto at = std::lower_bound(group.begin(), group.end(), result,
+                               [this](const Result &left, const Result &right) {
+                                   return better(left, right, conversion_ratio_);
+                               });
     group.insert(at, std::move(result));
     if (group.size() > capacity_)
         group.pop_back();
@@ -361,7 +369,9 @@ std::vector<Result> Ranking::results() const {
     std::vector<Result> out;
     for (auto &[n, g] : groups_)
         out.insert(out.end(), g.begin(), g.end());
-    std::sort(out.begin(), out.end(), better);
+    std::sort(out.begin(), out.end(), [this](const Result &a, const Result &b) {
+        return better(a, b, conversion_ratio_);
+    });
     return out;
 }
 
@@ -409,6 +419,7 @@ class Checkpoint {
                                    uint64_t(o.search_square),
                                    uint64_t(o.cluster_square),
                                    uint64_t(o.full_world),
+                                   uint64_t(std::llround(o.conversion_ratio * 1e9)),
                                    uint64_t(ranking_rule_version),
                                    uint64_t(ranking_capacity(o.result_limit))};
         for (auto value : values)
@@ -561,7 +572,7 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
     auto shards = make_shards(o);
     std::atomic<size_t> next{};
     std::mutex merge;
-    Ranking ranking(ranking_capacity(o.result_limit));
+    Ranking ranking(ranking_capacity(o.result_limit), o.conversion_ratio);
     Progress stats;
     stats.total = shards.size();
     stats.chunks = covered_chunks(o);
@@ -600,7 +611,7 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                         chambers[i] = engine.generate(floor_div(points[i].x, 16), floor_div(points[i].z, 16));
                         ++layouts;
                     }
-                Ranking local(ranking_capacity(o.result_limit));
+                Ranking local(ranking_capacity(o.result_limit), o.conversion_ratio);
                 for (auto &group : groups) {
                     control.checkpoint();
                     std::vector<Point> structures;

@@ -1,8 +1,10 @@
 #include "search.hpp"
 #include "json.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -74,6 +76,8 @@ static void validate(const Options &o) {
         throw std::invalid_argument("搜索中心超出世界边界");
     if (o.threads < 1 || o.threads > 32 || o.min_structures < 1 || o.min_spawners < 0 || o.result_limit < 0)
         throw std::invalid_argument("线程数需为1–32，筛选阈值需非负且密室数至少1");
+    if (!(o.conversion_ratio >= 0.0 && o.conversion_ratio <= 1.0))
+        throw std::invalid_argument("慢速笼折算比例需在0–1");
 }
 
 static bool square_shape(const std::string &shape) {
@@ -97,7 +101,8 @@ static Json params_json(const Options &o) {
             {"clusterShape", o.cluster_square ? "square" : "circle"},
             {"minStructures", o.min_structures},
             {"minSpawners", o.min_spawners},
-            {"generation", std::to_string(o.generation)}};
+            {"generation", std::to_string(o.generation)},
+            {"conversionRatio", o.conversion_ratio}};
 }
 
 // 展示距离统一在这里取整到一位小数，CSV/TXT/JSON 三个出口共用同一数值，避免各自格式化后出现 0.1 的差。
@@ -105,7 +110,7 @@ static double distance_of(const Result &r) {
     return std::round(std::sqrt(double(r.distance_sq)) * 10) / 10;
 }
 
-static Json candidate_json(const Result &r, int rank) {
+static Json candidate_json(const Result &r, int rank, double conversion_ratio) {
     uint64_t h = 1469598103934665603ULL;
     Json structures = Json::array();
     for (auto p : r.structures) {
@@ -121,6 +126,8 @@ static Json candidate_json(const Result &r, int rank) {
             {"score", r.spawners},
             {"fastSpawnerCount", r.fast_spawners},
             {"slowSpawnerCount", r.slow_spawners},
+            {"convertedSpawnerCount", converted_spawners(r, conversion_ratio)},
+            {"conversionRatio", conversion_ratio},
             {"scoreUnit", "刷怪笼"},
             {"distance", distance_of(r)},
             {"distanceSq", r.distance_sq},
@@ -135,7 +142,7 @@ static Json result_json(const Options &o, const SearchOutput &output, const std:
     Json candidates = Json::array();
     int rank = 0;
     for (const auto &r : output.results)
-        candidates.push_back(candidate_json(r, ++rank));
+        candidates.push_back(candidate_json(r, ++rank, o.conversion_ratio));
     int64_t search_ms = int64_t(std::llround(output.stats.elapsed_ms));
     return {{"jobId", job},
             {"protocolVersion", protocol_version},
@@ -262,6 +269,7 @@ static Options from_config(const Json &config) {
     o.cluster_radius = params.value("clusterRadiusBlocks", 128);
     o.min_structures = params.value("minStructures", 2);
     o.min_spawners = params.value("minSpawners", 20);
+    o.conversion_ratio = params.value("conversionRatio", 1.0);
     // v3 用 clusterShape 表达统计形状；旧配置里的 mode 已无执行语义，直接忽略。
     o.cluster_square = square_shape(params.value("clusterShape", std::string("square")));
     o.checkpoint_directory = "config/checkpoints/trial-native";
@@ -457,6 +465,7 @@ static int run(int argc, char **argv) {
                 std::cout << "trial-spawner --seed <seed> --version <1.21.1|26.2|26.3> --radius <blocks>\n"
                              "  --cluster-radius 128 --shape circle --cluster-shape circle\n"
                              "  --min-structures 2 --min-spawners 20 --threads 8 --limit 0\n"
+                             "  --conversion-ratio 1.0  (slow spawner weight; 1.0 keeps total-count ranking)\n"
                              "  --center-x 0 --center-z 0 --output results --full-world\n"
                              "  --chunk-x <chunk> --chunk-z <chunk>  (single chamber JSON)\n"
                              "  --config finder.properties --checkpoint-dir results/checkpoints\n"
@@ -465,7 +474,7 @@ static int run(int argc, char **argv) {
             }
             const std::vector<std::string> names = {
                 "--seed",           "--version",        "--generation",   "--radius",  "--cluster-radius", "--shape",
-                "--cluster-shape",  "--min-structures", "--min-spawners", "--threads", "--limit",          "--center-x",
+                "--cluster-shape",  "--min-structures", "--min-spawners", "--threads", "--limit", "--conversion-ratio", "--center-x",
                 "--center-z",       "--output",         "--full-world",   "--chunk-x", "--chunk-z",        "--config",
                 "--checkpoint-dir", "--no-checkpoint",  "--finder"};
             if (std::find(names.begin(), names.end(), name) == names.end())
@@ -493,6 +502,8 @@ static int run(int argc, char **argv) {
                                                              {"trial-area-shape", "--cluster-shape"},
                                                              {"trial-min-structures", "--min-structures"},
                                                              {"trial-min-spawners", "--min-spawners"},
+                                                             {"trial-conversion-ratio", "--conversion-ratio"},
+                                                             {"conversion-ratio", "--conversion-ratio"},
                                                              {"cluster-radius-blocks", "--cluster-radius"},
                                                              {"area-shape", "--cluster-shape"},
                                                              {"min-structures", "--min-structures"},
@@ -532,6 +543,15 @@ static int run(int argc, char **argv) {
                 throw std::invalid_argument("参数需为整数：" + name);
             return number;
         };
+        auto real = [&](const std::string &name, double value) {
+            auto input = text(name, std::to_string(value));
+            char *end = nullptr;
+            errno = 0;
+            const double number = std::strtod(input.c_str(), &end);
+            if (errno == ERANGE || !end || *end != '\0')
+                throw std::invalid_argument("参数需为数字：" + name);
+            return number;
+        };
         o.seed_text = text("--seed", "0");
         o.seed = parse_seed(o.seed_text);
         o.generation = generation_for(text("--version", text("--generation", "2")));
@@ -543,6 +563,7 @@ static int run(int argc, char **argv) {
         o.min_spawners = integer("--min-spawners", 20);
         o.threads = integer("--threads", 8);
         o.result_limit = integer("--limit", 0);
+        o.conversion_ratio = real("--conversion-ratio", 1.0);
         o.search_square = square_shape(text("--shape", "circle"));
         o.cluster_square = square_shape(text("--cluster-shape", "circle"));
         o.full_world = args.contains("--full-world");

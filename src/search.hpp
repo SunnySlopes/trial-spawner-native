@@ -10,14 +10,15 @@
 #include <string>
 
 #ifndef TRIAL_ENGINE_VERSION
-#define TRIAL_ENGINE_VERSION "3.0.1"
+#define TRIAL_ENGINE_VERSION "3.0.2"
 #endif
 
 namespace trial {
-// 桌面契约 v3：正式排名「主数量降序 → 距搜索中心水平距离平方升序 → X 升序 → Z 升序」。
+// 桌面契约 v3：正式排名「折算数量降序 → 距搜索中心水平距离平方升序 → X 升序 → Z 升序」。
+// conversion_ratio = 1.0 时折算数量等于总刷怪笼数，保持旧榜单。
 inline constexpr int protocol_version = 3;
-inline constexpr int ranking_rule_version = 3;
-inline constexpr const char *ranking_rule = "primary-desc-distance-asc-x-asc-z-asc";
+inline constexpr int ranking_rule_version = 4;
+inline constexpr const char *ranking_rule = "converted-desc-distance-asc-x-asc-z-asc";
 inline constexpr const char *engine_name = "trial-spawner-native";
 inline constexpr const char *engine_version = TRIAL_ENGINE_VERSION;
 
@@ -38,6 +39,8 @@ struct Options {
     int generation = 2, center_x = 0, center_z = 0, radius = 100000, cluster_radius = 128;
     int min_structures = 2, min_spawners = 20, threads = 8, result_limit = 0;
     int shard_size = 0;
+    // 快速笼按 1 计，慢速笼按该比例折算；1.0 = 旧的总笼数排名。
+    double conversion_ratio = 1.0;
     bool search_square = false, cluster_square = false, full_world = false;
     std::string checkpoint_directory;
 };
@@ -50,16 +53,25 @@ struct Result {
     int slow_spawners{};
 };
 
-bool better(const Result &a, const Result &b);
+// 旧测试/旧调用可能只填 spawners；快慢字段未填时退回总笼数，保证 ratio=1.0 兼容。
+inline double converted_spawners(const Result &r, double ratio) {
+    const int split = r.fast_spawners + r.slow_spawners;
+    if (split == 0 && r.spawners > 0) return double(r.spawners);
+    return double(r.fast_spawners) + double(r.slow_spawners) * ratio;
+}
+
+bool better(const Result &a, const Result &b, double conversion_ratio = 1.0);
 
 class Ranking {
     std::map<int, std::vector<Result>> groups_;
     size_t capacity_;
+    double conversion_ratio_;
 
   public:
-    explicit Ranking(size_t capacity) : capacity_(capacity) {}
+    explicit Ranking(size_t capacity, double conversion_ratio = 1.0)
+        : capacity_(capacity), conversion_ratio_(conversion_ratio) {}
 
-    bool discard(int count, int upper) const;
+    bool discard(int count, double upper) const;
     void accept(Result result);
     std::vector<Result> results() const;
     size_t size() const;
