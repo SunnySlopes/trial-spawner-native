@@ -234,6 +234,7 @@ Chamber LayoutEngine::generate(int cx, int cz) {
         int id, rotation;
         Vec3 pos;
         Box box;
+        bool slow{};
     };
 
     struct Task {
@@ -263,12 +264,20 @@ Chamber LayoutEngine::generate(int cx, int cz) {
     auto &connectors = connectors_;
     auto &candidates = candidates_;
     auto &fallbacks = fallbacks_;
+    // 慢速池先放连接件再放笼子；标记沿这条拼装分支传递，不额外消耗随机数。
+    auto collect_spawners = [&](const Variant &variant, Vec3 pos, bool slow) {
+        for (auto p : variant.spawners) {
+            result.spawners.push_back(pos + p);
+            if (slow) {
+                result.slow_spawners.push_back(pos + p);
+            }
+        }
+    };
     for (;;) {
         auto piece = task.piece;
         const auto &variant = tables_.variants[piece.id][piece.rotation];
         ++result.pieces;
-        for (auto p : variant.spawners)
-            result.spawners.push_back(piece.pos + p);
+        collect_spawners(variant, piece.pos, piece.slow);
         variant.connector_order(random, parents);
         Space *internal = nullptr;
         for (int parent_index : parents) {
@@ -337,13 +346,18 @@ Chamber LayoutEngine::generate(int cx, int cz) {
                         if (!available->fits(box))
                             continue;
                         available->occupy(box);
-                        Piece placed{child_id, child_rotation, pos, box};
+                        Piece placed{
+                            child_id,
+                            child_rotation,
+                            pos,
+                            box,
+                            piece.slow || parent.pool == data.slow_spawner_pool
+                        };
                         if (task.depth + 1 <= data.depth)
                             pending[parent.placement].push_back({placed, available, task.depth + 1});
                         else {
                             ++result.pieces;
-                            for (auto p : child.spawners)
-                                result.spawners.push_back(pos + p);
+                            collect_spawners(child, pos, placed.slow);
                         }
                         attached = true;
                         break;
@@ -366,6 +380,9 @@ Chamber LayoutEngine::generate(int cx, int cz) {
     }
     std::sort(result.spawners.begin(), result.spawners.end());
     result.spawners.erase(std::unique(result.spawners.begin(), result.spawners.end()), result.spawners.end());
+    std::sort(result.slow_spawners.begin(), result.slow_spawners.end());
+    result.slow_spawners.erase(std::unique(result.slow_spawners.begin(), result.slow_spawners.end()),
+                              result.slow_spawners.end());
     return result;
 }
 }

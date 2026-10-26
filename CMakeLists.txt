@@ -10,7 +10,7 @@ target_include_directories(biomes PUBLIC ${CUBIOMES})
 add_library(trial_layout STATIC src/layout.cpp src/search.cpp src/climate263.cpp)
 target_include_directories(trial_layout PUBLIC src data)
 # 桌面契约 SearchResult.engineVersion；协议/排名规则或二进制行为变化时同步。
-target_compile_definitions(trial_layout PUBLIC TRIAL_ENGINE_VERSION="3.0.0")
+target_compile_definitions(trial_layout PUBLIC TRIAL_ENGINE_VERSION="3.0.1")
 target_link_libraries(trial_layout PUBLIC biomes)
 add_executable(trial-spawner src/main.cpp)
 target_include_directories(trial-spawner PRIVATE third_party)

@@ -10,7 +10,7 @@
 #include <string>
 
 #ifndef TRIAL_ENGINE_VERSION
-#define TRIAL_ENGINE_VERSION "3.0.0"
+#define TRIAL_ENGINE_VERSION "3.0.1"
 #endif
 
 namespace trial {
@@ -46,6 +46,8 @@ struct Result {
     int x{}, z{}, count{}, spawners{};
     std::vector<Point> structures;
     int64_t distance_sq{};
+    int fast_spawners{};
+    int slow_spawners{};
 };
 
 bool better(const Result &a, const Result &b);

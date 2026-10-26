@@ -81,6 +81,7 @@ struct LayoutData {
     std::vector<Pool> pools;
     std::vector<AliasGroup> aliases;
     int start_pool{}, depth{}, distance{}, padding_bottom{}, padding_top{}, min_y{}, max_y{};
+    int slow_spawner_pool{};
 };
 
 class Random {
@@ -194,6 +195,7 @@ struct Chamber {
     Vec3 biome_position{};
     std::vector<Vec3> spawners;
     int pieces{};
+    std::vector<Vec3> slow_spawners;
 };
 
 class LayoutEngine {

@@ -187,6 +187,7 @@ inline LayoutData legacy_data() {
   d.padding_top = 10;
   d.min_y = -40;
   d.max_y = -20;
+  d.slow_spawner_pool = 41;
   return d;
 }
 inline LayoutData modern_data() {
@@ -397,5 +398,6 @@ inline LayoutData modern_data() {
   d.padding_top = 10;
   d.min_y = -40;
   d.max_y = -20;
+  d.slow_spawner_pool = 43;
   return d;
 }

@@ -395,7 +395,7 @@ class Checkpoint {
         uint64_t hash = 1469598103934665603ULL;
         // 分片划分由调度版本、线程数与范围决定；旧划分的完成位不能复用。
         // 排名规则版本与组容量也进指纹：排序或 Top K 容量变了，旧榜单不是新规则下的完整榜单。
-        const uint64_t values[] = {4,
+        const uint64_t values[] = {5,
                                    o.seed,
                                    uint64_t(o.generation),
                                    uint64_t(o.center_x),
@@ -417,7 +417,7 @@ class Checkpoint {
                 value >>= 8;
             }
         std::filesystem::create_directories(o.checkpoint_directory);
-        path_ = std::filesystem::path(o.checkpoint_directory) / ("native-v4-" + std::to_string(hash) + ".bin");
+        path_ = std::filesystem::path(o.checkpoint_directory) / ("native-v5-" + std::to_string(hash) + ".bin");
     }
 
     bool done(size_t index) const {
@@ -432,7 +432,7 @@ class Checkpoint {
         if (path_.empty() || !std::filesystem::exists(path_))
             return;
         std::ifstream file(path_, std::ios::binary);
-        if (read_value<uint32_t>(file) != 0x54534632 || read_value<uint64_t>(file) != completed.size())
+        if (read_value<uint32_t>(file) != 0x54534635 || read_value<uint64_t>(file) != completed.size())
             throw std::runtime_error("原生断点格式不匹配");
         file.read(reinterpret_cast<char *>(completed.data()), std::streamsize(completed.size() * sizeof(uint64_t)));
         stats.candidates = read_value<uint64_t>(file);
@@ -446,6 +446,8 @@ class Checkpoint {
             r.z = read_value<int>(file);
             r.count = read_value<int>(file);
             r.spawners = read_value<int>(file);
+            r.fast_spawners = read_value<int>(file);
+            r.slow_spawners = read_value<int>(file);
             r.distance_sq = read_value<int64_t>(file);
             for (int j = 0; j < r.count; ++j) {
                 Point p;
@@ -469,7 +471,7 @@ class Checkpoint {
         auto temporary = path_;
         temporary += ".tmp";
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        write_value(file, uint32_t(0x54534632));
+        write_value(file, uint32_t(0x54534635));
         write_value(file, uint64_t(completed.size()));
         file.write(reinterpret_cast<const char *>(completed.data()),
                    std::streamsize(completed.size() * sizeof(uint64_t)));
@@ -484,6 +486,8 @@ class Checkpoint {
             write_value(file, r.z);
             write_value(file, r.count);
             write_value(file, r.spawners);
+            write_value(file, r.fast_spawners);
+            write_value(file, r.slow_spawners);
             write_value(file, r.distance_sq);
             for (auto p : r.structures) {
                 write_value(file, p.x);
@@ -601,11 +605,14 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                     control.checkpoint();
                     std::vector<Point> structures;
                     std::vector<Vec3> spawners;
+                    std::vector<Vec3> slow_spawners;
                     for (int i : group)
                         if (!chambers[i].spawners.empty()) {
                             structures.push_back(points[i]);
                             auto &s = chambers[i].spawners;
                             spawners.insert(spawners.end(), s.begin(), s.end());
+                            const auto &slow = chambers[i].slow_spawners;
+                            slow_spawners.insert(slow_spawners.end(), slow.begin(), slow.end());
                         }
                     if (int(structures.size()) < o.min_structures)
                         continue;
@@ -626,8 +633,22 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                     auto result = optimize_center(o, structures, spawners, &control);
                     // 正式排名用的距离参照本次任务实际 bounds.center；组内几何优化仍只看覆盖率。
                     result.distance_sq = squared_distance(result.x, result.z, o.center_x, o.center_z);
-                    if (result.spawners >= o.min_spawners)
+                    if (result.spawners >= o.min_spawners) {
+                        std::sort(slow_spawners.begin(), slow_spawners.end());
+                        slow_spawners.erase(std::unique(slow_spawners.begin(), slow_spawners.end()),
+                                            slow_spawners.end());
+                        for (auto p : slow_spawners) {
+                            int64_t dx = int64_t(p.x) - result.x;
+                            int64_t dz = int64_t(p.z) - result.z;
+                            if (o.cluster_square
+                                    ? (std::abs(dx) <= o.cluster_radius && std::abs(dz) <= o.cluster_radius)
+                                    : (dx * dx + dz * dz <= int64_t(o.cluster_radius) * o.cluster_radius)) {
+                                ++result.slow_spawners;
+                            }
+                        }
+                        result.fast_spawners = result.spawners - result.slow_spawners;
                         local.accept(std::move(result));
+                    }
                 }
                 std::lock_guard lock(merge);
                 for (auto &result : local.results())

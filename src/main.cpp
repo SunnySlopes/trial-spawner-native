@@ -119,6 +119,8 @@ static Json candidate_json(const Result &r, int rank) {
             {"x", r.x},
             {"z", r.z},
             {"score", r.spawners},
+            {"fastSpawnerCount", r.fast_spawners},
+            {"slowSpawnerCount", r.slow_spawners},
             {"scoreUnit", "刷怪笼"},
             {"distance", distance_of(r)},
             {"distanceSq", r.distance_sq},
