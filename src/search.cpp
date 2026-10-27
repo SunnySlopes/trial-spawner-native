@@ -96,6 +96,34 @@ static Window cluster_window(const Options &o) {
     return {o.cluster_radius, o.cluster_radius, !o.cluster_square};
 }
 
+// 严格模式把“结构起点”的窗口四边各缩进 strict_margin 格：clusters() 只用这个内窗口收集成员，
+// 贴边的密室因此不进入该组（不模拟、不计结构数、不计笼子）；optimize_center 的笼子统计仍用完整窗口。
+static Window structure_window(const Options &o) {
+    auto window = cluster_window(o);
+    if (!o.strict_mode)
+        return window;
+    window.half_x = std::max(0, window.half_x - o.strict_margin);
+    window.half_z = std::max(0, window.half_z - o.strict_margin);
+    return window;
+}
+
+// 某 |dz| 处的水平半宽：矩形恒为 half_x，圆形按 sqrt(half_x^2 - dz^2) 收缩。
+static std::vector<int> horizontal_extent(int half_x, int half_z, bool circle) {
+    std::vector<int> extent(size_t(half_z) + 1, half_x);
+    if (!circle)
+        return extent;
+    for (int dz = 0; dz <= half_z; ++dz) {
+        const int64_t value = int64_t(half_x) * half_x - int64_t(dz) * dz;
+        int h = int(std::sqrt(double(value)));
+        while (int64_t(h + 1) * (h + 1) <= value)
+            ++h;
+        while (int64_t(h) * h > value)
+            --h;
+        extent[dz] = h;
+    }
+    return extent;
+}
+
 static int cluster_max_half(const Options &o) {
     const auto window = cluster_window(o);
     return std::max({1, window.half_x, window.half_z});
@@ -225,7 +253,9 @@ static std::vector<Point> enumerate(const Options &o, const Shard &s) {
 
 static std::vector<std::vector<int>> clusters(const Options &o, const Shard &shard, const std::vector<Point> &points,
                                               Control &control) {
-    const auto window = cluster_window(o);
+    // 严格模式下只有起点落在缩进窗口里的密室才算这一组的结构；贴边密室整间剔除，不参与结构数也不计笼子。
+    // 笼子统计仍由 optimize_center 用完整窗口做，所以内窗口成员的笼子不会被边界裁掉。
+    const auto window = structure_window(o);
     const int half_x = window.half_x, half_z = window.half_z;
     Grid grid(points, cluster_max_half(o) * 2);
     std::unordered_set<std::vector<int>, IndexHash> unique;
@@ -326,25 +356,19 @@ static std::vector<std::vector<int>> clusters(const Options &o, const Shard &sha
 
 Result optimize_center(const Options &o, const std::vector<Point> &structures, const std::vector<Vec3> &spawners,
                        Control *control) {
-    const auto window = cluster_window(o);
+    const auto window = cluster_window(o);   // 完整统计窗口：只用于数笼子
+    const auto fit = structure_window(o);    // 结构起点窗口：严格模式下比统计窗口各小 strict_margin
     const int half_x = window.half_x, half_z = window.half_z;
+    const int fit_x = fit.half_x, fit_z = fit.half_z;
     int min_z = std::numeric_limits<int>::min(), max_z = std::numeric_limits<int>::max();
     for (auto p : structures) {
-        min_z = std::max(min_z, p.z - half_z);
-        max_z = std::min(max_z, p.z + half_z);
+        min_z = std::max(min_z, p.z - fit_z);
+        max_z = std::min(max_z, p.z + fit_z);
     }
-    std::vector<int> horizontal(half_z + 1, half_x);
-    if (window.circle)
-        for (int dz = 0; dz <= half_z; ++dz) {
-            int64_t value = int64_t(half_x) * half_x - int64_t(dz) * dz;
-            int h = int(std::sqrt(double(value)));
-            while (int64_t(h + 1) * (h + 1) <= value)
-                ++h;
-            while (int64_t(h) * h > value)
-                --h;
-            horizontal[dz] = h;
-        }
-    std::vector<int> difference(2 * half_x + 3);
+    const auto fit_extent = horizontal_extent(fit_x, fit_z, fit.circle);
+    const auto count_extent = horizontal_extent(half_x, half_z, window.circle);
+    // 可行中心的 x 跨度不超过结构窗口宽度，差分数组按它开就够；笼子统计的半宽可以比它大，靠裁剪对齐。
+    std::vector<int> difference(2 * fit_x + 3);
     Result best{0, 0, int(structures.size()), -1, structures};
     for (int z = min_z; z <= max_z; ++z) {
         if (control && ((z - min_z) & 15) == 0)
@@ -352,12 +376,12 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
         int min_x = std::numeric_limits<int>::min(), max_x = std::numeric_limits<int>::max();
         for (auto p : structures) {
             int dz = std::abs(p.z - z);
-            if (dz > half_z) {
+            if (dz > fit_z) {
                 min_x = 1;
                 max_x = 0;
                 break;
             }
-            int h = horizontal[dz];
+            int h = fit_extent[dz];
             min_x = std::max(min_x, p.x - h);
             max_x = std::min(max_x, p.x + h);
         }
@@ -369,7 +393,7 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
             int dz = std::abs(p.z - z);
             if (dz > half_z)
                 continue;
-            int h = horizontal[dz], from = std::max(min_x, p.x - h), to = std::min(max_x, p.x + h);
+            int h = count_extent[dz], from = std::max(min_x, p.x - h), to = std::min(max_x, p.x + h);
             if (from <= to) {
                 ++difference[from - min_x];
                 --difference[to - min_x + 1];
@@ -386,7 +410,7 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
             }
         }
     }
-    return best;
+    return best; // spawners < 0 表示结构窗口内无可行中心（理论上严格模式下成员在候选中心已可行）
 }
 
 // 组容量沿用 ranking_capacity()：旧的固定 100 条上限会让「前 200」在同数量组内提前丢掉仍可能按距离胜出的候选。
@@ -490,6 +514,24 @@ class Checkpoint {
         if (o.cluster_rect) {
             const uint64_t window[] = {2, uint64_t(o.cluster_long), uint64_t(o.cluster_short)};
             for (auto value : window)
+                for (int i = 0; i < 8; ++i) {
+                    hash = (hash ^ (value & 255)) * 1099511628211ULL;
+                    value >>= 8;
+                }
+        }
+        // 严格模式改变了可行中心，旧榜单不能复用；同样只在启用时加盐，普通模式的断点文件名保持不变。
+        if (o.strict_mode) {
+            const uint64_t mode[] = {3, uint64_t(o.strict_margin)};
+            for (auto value : mode)
+                for (int i = 0; i < 8; ++i) {
+                    hash = (hash ^ (value & 255)) * 1099511628211ULL;
+                    value >>= 8;
+                }
+        }
+        // 联数上限会改变收录范围；只在启用时加盐，默认 0 的断点文件名保持不变。
+        if (o.max_structures > 0) {
+            const uint64_t mode[] = {4, uint64_t(o.max_structures)};
+            for (auto value : mode)
                 for (int i = 0; i < 8; ++i) {
                     hash = (hash ^ (value & 255)) * 1099511628211ULL;
                     value >>= 8;
@@ -695,6 +737,11 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                         }
                     if (int(structures.size()) < o.min_structures)
                         continue;
+                    // 联数上限：超过上限的簇整组剔除（不枚举子集），保证结果最多 max_structures 联。
+                    if (o.max_structures > 0 && int(structures.size()) > o.max_structures)
+                        continue;
+                    // 这里只是用簇内去重前的总数做上界预筛：比率限制在 0–1，等效笼数不会超过总数，
+                    // 所以“总数都不够”时必然不够。真正的阈值判断在 optimize_center 之后按等效笼数做。
                     if (int(spawners.size()) < o.min_spawners ||
                         local.discard(int(structures.size()), int(spawners.size()))) {
                         ++pruned;
@@ -710,24 +757,27 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                     std::sort(spawners.begin(), spawners.end());
                     spawners.erase(std::unique(spawners.begin(), spawners.end()), spawners.end());
                     auto result = optimize_center(o, structures, spawners, &control);
+                    // 严格模式下这组密室起点无法全部离窗口边界 strict_margin 格时，没有可行中心。
+                    if (result.spawners < 0)
+                        continue;
                     // 正式排名用的距离参照本次任务实际 bounds.center；组内几何优化仍只看覆盖率。
                     result.distance_sq = squared_distance(result.x, result.z, center_x, center_z);
-                    if (result.spawners >= o.min_spawners) {
-                        std::sort(slow_spawners.begin(), slow_spawners.end());
-                        slow_spawners.erase(std::unique(slow_spawners.begin(), slow_spawners.end()),
-                                            slow_spawners.end());
-                        for (auto p : slow_spawners) {
-                            int64_t dx = int64_t(p.x) - result.x;
-                            int64_t dz = int64_t(p.z) - result.z;
-                            bool inside = window.circle
-                                ? (dx * dx + dz * dz <= int64_t(half_x) * half_x)
-                                : (std::abs(dx) <= half_x && std::abs(dz) <= half_z);
-                            if (inside)
-                                ++result.slow_spawners;
-                        }
-                        result.fast_spawners = result.spawners - result.slow_spawners;
-                        local.accept(std::move(result));
+                    std::sort(slow_spawners.begin(), slow_spawners.end());
+                    slow_spawners.erase(std::unique(slow_spawners.begin(), slow_spawners.end()),
+                                        slow_spawners.end());
+                    for (auto p : slow_spawners) {
+                        int64_t dx = int64_t(p.x) - result.x;
+                        int64_t dz = int64_t(p.z) - result.z;
+                        bool inside = window.circle
+                            ? (dx * dx + dz * dz <= int64_t(half_x) * half_x)
+                            : (std::abs(dx) <= half_x && std::abs(dz) <= half_z);
+                        if (inside)
+                            ++result.slow_spawners;
                     }
+                    result.fast_spawners = result.spawners - result.slow_spawners;
+                    // 阈值口径与排名键一致：窗口内等效笼数（快 + 慢×比例），不再是快慢总数。
+                    if (meets_min_spawners(result, o.min_spawners, o.conversion_ratio))
+                        local.accept(std::move(result));
                 }
                 std::lock_guard lock(merge);
                 for (auto &result : local.results())

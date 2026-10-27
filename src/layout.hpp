@@ -198,6 +198,18 @@ struct Chamber {
     std::vector<Vec3> slow_spawners;
 };
 
+/**
+ * 逐件输出（仅地图图层使用）：盒 + 拼装父子关系 + 该件作为“宿主房间”时的笼数。
+ * `spawners`/`slow_spawners` 由 collect_spawners 按“挂件 → 支架 → 房间”两跳回溯累加。
+ */
+struct PieceBox {
+    Box box;
+    bool slow{};
+    int parent{-1};
+    int spawners{};
+    int slow_spawners{};
+};
+
 class LayoutEngine {
     struct Space {
         Box bounds;
@@ -240,6 +252,10 @@ class LayoutEngine {
 
   public:
     LayoutEngine(int generation, uint64_t seed);
-    Chamber generate(int chunk_x, int chunk_z);
+    /**
+     * `out_boxes` 非空时按放置顺序写入每个件（含根件）的盒、父件下标与宿主笼数；
+     * 搜索热路径不传，保持零额外分配。返回的 `pieces` 计数等于写入的件数。
+     */
+    Chamber generate(int chunk_x, int chunk_z, std::vector<PieceBox> *out_boxes = nullptr);
 };
 }

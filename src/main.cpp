@@ -96,8 +96,19 @@ static void validate(const Options &o) {
     }
     if (o.threads < 1 || o.threads > 32 || o.min_structures < 1 || o.min_spawners < 0 || o.result_limit < 0)
         throw std::invalid_argument("线程数需为1–32，筛选阈值需非负且密室数至少1");
+    if (o.max_structures < 0 || (o.max_structures > 0 && o.min_structures > o.max_structures))
+        throw std::invalid_argument("联数上限需为非负整数，且不能小于最低密室数");
     if (!(o.conversion_ratio >= 0.0 && o.conversion_ratio <= 1.0))
         throw std::invalid_argument("慢速笼折算比例需在0–1");
+    if (o.strict_margin < 0)
+        throw std::invalid_argument("严格模式边距需为非负整数");
+    if (o.strict_mode) {
+        // 结构起点要能从四边各缩进 strict_margin 格，窗口必须比它宽；否则内窗口为空。
+        const int half_x = o.cluster_rect ? o.cluster_long / 2 : o.cluster_radius;
+        const int half_z = o.cluster_rect ? o.cluster_short / 2 : o.cluster_radius;
+        if (half_x <= o.strict_margin || half_z <= o.strict_margin)
+            throw std::invalid_argument("严格模式要求统计窗口半宽大于边距（长/短边>2×边距，或半径>边距）");
+    }
 }
 
 static bool square_shape(const std::string &shape) {
@@ -130,7 +141,12 @@ static Json params_json(const Options &o) {
                 {"minStructures", o.min_structures},
                 {"minSpawners", o.min_spawners},
                 {"generation", std::to_string(o.generation)},
-                {"conversionRatio", o.conversion_ratio}};
+                {"conversionRatio", o.conversion_ratio},
+                {"strictMode", o.strict_mode}};
+    if (o.strict_mode)
+        out["strictMargin"] = o.strict_margin;
+    if (o.max_structures > 0)
+        out["maxStructures"] = o.max_structures;
     if (o.cluster_rect) {
         out["clusterLongSide"] = o.cluster_long;
         out["clusterShortSide"] = o.cluster_short;
@@ -333,7 +349,10 @@ static Options from_config(const Json &config) {
     }
     o.min_structures = params.value("minStructures", 2);
     o.min_spawners = params.value("minSpawners", 20);
+    o.max_structures = params.value("maxStructures", 0);
     o.conversion_ratio = params.value("conversionRatio", 1.0);
+    o.strict_mode = params.value("strictMode", false);
+    o.strict_margin = params.value("strictMargin", default_strict_margin);
     o.checkpoint_directory = "config/checkpoints/trial-native";
     validate(o);
     return o;
@@ -529,7 +548,14 @@ static int run(int argc, char **argv) {
                              "  --cluster-radius 128 --cluster-long <side> --cluster-short <side>\n"
                              "  --shape circle --cluster-shape circle  (cluster-long/short select a rectangular window)\n"
                              "  --min-structures 2 --min-spawners 20 --threads 8 --limit 0\n"
+                             "  --max-structures 0  cap the chambers counted per result (0 = unlimited);\n"
+                             "    clusters above the cap are dropped as a whole\n"
+                             "  --min-spawners is the minimum equivalent count inside the window\n"
+                             "    (fast + slow * conversion-ratio), not the fast+slow total\n"
                              "  --conversion-ratio 1.0  (slow spawner weight; 1.0 keeps total-count ranking)\n"
+                             "  --strict-mode  structure starts must stay <strict-margin> blocks inside the window;\n"
+                             "    spawner counting still uses the full window\n"
+                             "  --strict-margin 0  inner margin used by --strict-mode\n"
                              "  --center-x 0 --center-z 0 --output results --full-world\n"
                              "  --chunk-x <chunk> --chunk-z <chunk>  (single chamber JSON)\n"
                              "  --config finder.properties --checkpoint-dir results/checkpoints\n"
@@ -541,10 +567,10 @@ static int run(int argc, char **argv) {
                 "--max-z",          "--cluster-radius", "--cluster-long", "--cluster-short", "--shape",        "--cluster-shape", "--min-structures", "--min-spawners",
                 "--threads",        "--limit",          "--conversion-ratio", "--center-x",
                 "--center-z",       "--output",         "--full-world",   "--chunk-x", "--chunk-z",        "--config",
-                "--checkpoint-dir", "--no-checkpoint",  "--finder"};
+                "--checkpoint-dir", "--no-checkpoint",  "--strict-mode",  "--strict-margin", "--max-structures", "--finder"};
             if (std::find(names.begin(), names.end(), name) == names.end())
                 throw std::invalid_argument("未知参数：" + name);
-            if (name == "--full-world" || name == "--no-checkpoint")
+            if (name == "--full-world" || name == "--no-checkpoint" || name == "--strict-mode")
                 args[name] = "true";
             else {
                 if (i + 1 == argc)
@@ -580,7 +606,13 @@ static int run(int argc, char **argv) {
                                                              {"cluster-radius-blocks", "--cluster-radius"},
                                                              {"area-shape", "--cluster-shape"},
                                                              {"min-structures", "--min-structures"},
-                                                             {"min-spawners", "--min-spawners"}};
+                                                             {"min-spawners", "--min-spawners"},
+                                                             {"trial-strict-mode", "--strict-mode"},
+                                                             {"strict-mode", "--strict-mode"},
+                                                             {"trial-strict-margin", "--strict-margin"},
+                                                             {"strict-margin", "--strict-margin"},
+                                                             {"trial-max-structures", "--max-structures"},
+                                                             {"max-structures", "--max-structures"}};
             for (std::string line; std::getline(file, line);) {
                 auto first = line.find_first_not_of(" \t\r\xef\xbb\xbf");
                 if (first == std::string::npos || line[first] == '#')
@@ -664,9 +696,12 @@ static int run(int argc, char **argv) {
         }
         o.min_structures = integer("--min-structures", 2);
         o.min_spawners = integer("--min-spawners", 20);
+        o.max_structures = integer("--max-structures", 0);
         o.threads = integer("--threads", 8);
         o.result_limit = integer("--limit", 0);
         o.conversion_ratio = real("--conversion-ratio", 1.0);
+        o.strict_mode = text("--strict-mode", "false") == "true";
+        o.strict_margin = integer("--strict-margin", default_strict_margin);
         o.full_world = args.contains("--full-world");
         validate(o);
         if (!args.contains("--no-checkpoint"))
@@ -675,16 +710,32 @@ static int run(int argc, char **argv) {
         if (args.contains("--chunk-x") || args.contains("--chunk-z")) {
             LayoutEngine engine(o.generation, o.seed);
             int x = integer("--chunk-x", 0), z = integer("--chunk-z", 0);
-            auto chamber = engine.generate(x, z);
+            std::vector<PieceBox> boxes;
+            auto chamber = engine.generate(x, z, &boxes);
             Json out = {{"seed", o.seed_text},
                         {"generation", o.generation},
                         {"chunkX", x},
                         {"chunkZ", z},
                         {"exists", chamber.exists},
                         {"pieces", chamber.pieces},
-                        {"spawners", Json::array()}};
+                        {"spawners", Json::array()},
+                        {"slowSpawners", Json::array()},
+                        {"boxes", Json::array()}};
             for (auto p : chamber.spawners)
                 out["spawners"].push_back({p.x, p.y, p.z});
+            for (auto p : chamber.slow_spawners)
+                out["slowSpawners"].push_back({p.x, p.y, p.z});
+            for (auto &b : boxes)
+                out["boxes"].push_back({{"minX", b.box.lo.x},
+                                        {"minY", b.box.lo.y},
+                                        {"minZ", b.box.lo.z},
+                                        {"maxX", b.box.hi.x},
+                                        {"maxY", b.box.hi.y},
+                                        {"maxZ", b.box.hi.z},
+                                        {"slow", b.slow},
+                                        {"parent", b.parent},
+                                        {"spawners", b.spawners},
+                                        {"slowSpawners", b.slow_spawners}});
             std::cout << out.dump() << '\n';
             return 0;
         }
