@@ -84,6 +84,23 @@ static uint64_t key(int x, int z) {
     return (uint64_t(uint32_t(x)) << 32) | uint32_t(z);
 }
 
+// 统计窗口：圆、方、矩形三种。矩形按长边/短边各取一半作为闭区间半宽。
+struct Window {
+    int half_x, half_z;
+    bool circle;
+};
+
+static Window cluster_window(const Options &o) {
+    if (o.cluster_rect)
+        return {std::max(0, o.cluster_long / 2), std::max(0, o.cluster_short / 2), false};
+    return {o.cluster_radius, o.cluster_radius, !o.cluster_square};
+}
+
+static int cluster_max_half(const Options &o) {
+    const auto window = cluster_window(o);
+    return std::max({1, window.half_x, window.half_z});
+}
+
 struct IndexHash {
     size_t operator()(const std::vector<int> &values) const {
         size_t h = 0;
@@ -124,16 +141,39 @@ struct Shard {
     }
 };
 
+struct Bounds {
+    int min_x, max_x, min_z, max_z;
+};
+
+// 搜索范围统一在这里求值：full_world 优先，其次精确四至，最后是旧的 center + radius。
+static Bounds search_bounds(const Options &o) {
+    constexpr int world_min = -30000000, world_max = 29999999;
+    if (o.full_world)
+        return {world_min, world_max, world_min, world_max};
+    if (o.search_rect)
+        return {std::clamp(o.min_x, world_min, world_max), std::clamp(o.max_x, world_min, world_max),
+                std::clamp(o.min_z, world_min, world_max), std::clamp(o.max_z, world_min, world_max)};
+    return {std::clamp(o.center_x - o.radius, world_min, world_max),
+            std::clamp(o.center_x + o.radius, world_min, world_max),
+            std::clamp(o.center_z - o.radius, world_min, world_max),
+            std::clamp(o.center_z + o.radius, world_min, world_max)};
+}
+
+// 排名与分片调度使用的中心：精确四至取矩形中点，旧路径取 Options.center。
+static int bounds_center_x(const Options &o, const Bounds &b) {
+    return o.full_world ? o.center_x : o.search_rect ? int((int64_t(b.min_x) + b.max_x) / 2) : o.center_x;
+}
+
+static int bounds_center_z(const Options &o, const Bounds &b) {
+    return o.full_world ? o.center_z : o.search_rect ? int((int64_t(b.min_z) + b.max_z) / 2) : o.center_z;
+}
+
 static std::vector<Shard> make_shards(const Options &o) {
-    int lx = -30000000, hx = 29999999, lz = lx, hz = hx;
-    if (!o.full_world) {
-        lx = std::max(lx, o.center_x - o.radius);
-        hx = std::min(hx, o.center_x + o.radius);
-        lz = std::max(lz, o.center_z - o.radius);
-        hz = std::min(hz, o.center_z + o.radius);
-    }
+    const auto bounds = search_bounds(o);
+    int lx = bounds.min_x, hx = bounds.max_x, lz = bounds.min_z, hz = bounds.max_z;
     if (lx > hx || lz > hz)
         return {};
+    const int center_x = bounds_center_x(o, bounds), center_z = bounds_center_z(o, bounds);
     double area = double(int64_t(hx) - lx + 1) * double(int64_t(hz) - lz + 1);
     // 增加独立任务以减少慢任务拖尾；原生实测中更大分片降低吞吐。
     int size = std::clamp(int(std::ceil(std::sqrt(area / (o.threads * 8.0)))), 16384, 262144);
@@ -146,8 +186,8 @@ static std::vector<Shard> make_shards(const Options &o) {
                 {int(x), int(std::min<int64_t>(hx, x + size - 1)), int(z), int(std::min<int64_t>(hz, z + size - 1))});
     std::sort(shards.begin(), shards.end(), [&](const Shard &a, const Shard &b) {
         auto distance = [&](const Shard &s) {
-            int64_t x = std::clamp(o.center_x, s.min_x, s.max_x) - int64_t(o.center_x),
-                    z = std::clamp(o.center_z, s.min_z, s.max_z) - int64_t(o.center_z);
+            int64_t x = std::clamp(center_x, s.min_x, s.max_x) - int64_t(center_x),
+                    z = std::clamp(center_z, s.min_z, s.max_z) - int64_t(center_z);
             return x * x + z * z;
         };
         return std::tuple{distance(a), a.min_x, a.min_z} < std::tuple{distance(b), b.min_x, b.min_z};
@@ -156,7 +196,8 @@ static std::vector<Shard> make_shards(const Options &o) {
 }
 
 static std::vector<Point> enumerate(const Options &o, const Shard &s) {
-    int margin = o.cluster_radius * 2;
+    const auto bounds = search_bounds(o);
+    int margin = cluster_max_half(o) * 2;
     int lx = std::max(-30000000, s.min_x - margin), hx = std::min(29999999, s.max_x + margin);
     int lz = std::max(-30000000, s.min_z - margin), hz = std::min(29999999, s.max_z + margin);
     std::vector<Point> points;
@@ -166,10 +207,15 @@ static std::vector<Point> enumerate(const Options &o, const Shard &s) {
             if (p.x < lx || p.x > hx || p.z < lz || p.z > hz)
                 continue;
             if (!o.full_world) {
-                int64_t dx = int64_t(p.x) - o.center_x, dz = int64_t(p.z) - o.center_z;
-                if (o.search_square ? (std::abs(dx) > o.radius || std::abs(dz) > o.radius)
-                                    : (dx * dx + dz * dz > int64_t(o.radius) * o.radius))
-                    continue;
+                if (o.search_rect) {
+                    if (p.x < bounds.min_x || p.x > bounds.max_x || p.z < bounds.min_z || p.z > bounds.max_z)
+                        continue;
+                } else {
+                    int64_t dx = int64_t(p.x) - o.center_x, dz = int64_t(p.z) - o.center_z;
+                    if (o.search_square ? (std::abs(dx) > o.radius || std::abs(dz) > o.radius)
+                                        : (dx * dx + dz * dz > int64_t(o.radius) * o.radius))
+                        continue;
+                }
             }
             points.push_back(p);
         }
@@ -179,17 +225,20 @@ static std::vector<Point> enumerate(const Options &o, const Shard &s) {
 
 static std::vector<std::vector<int>> clusters(const Options &o, const Shard &shard, const std::vector<Point> &points,
                                               Control &control) {
-    Grid grid(points, o.cluster_radius * 2);
+    const auto window = cluster_window(o);
+    const int half_x = window.half_x, half_z = window.half_z;
+    Grid grid(points, cluster_max_half(o) * 2);
     std::unordered_set<std::vector<int>, IndexHash> unique;
     std::vector<std::vector<int>> found;
-    double radius2 = double(o.cluster_radius) * o.cluster_radius;
+    double radius2 = double(half_x) * half_x;
     auto accept = [&](double x, double z) {
         std::vector<int> members;
         members.reserve(4);
         grid.nearby(int(std::floor(x)), int(std::floor(z)), [&](int i) {
             double dx = points[i].x - x, dz = points[i].z - z;
-            if (o.cluster_square ? (std::abs(dx) <= o.cluster_radius && std::abs(dz) <= o.cluster_radius)
-                                 : (dx * dx + dz * dz <= radius2 + 1e-7))
+            bool inside = window.circle ? (dx * dx + dz * dz <= radius2 + 1e-7)
+                                        : (std::abs(dx) <= half_x && std::abs(dz) <= half_z);
+            if (inside)
                 members.push_back(i);
         });
         if (int(members.size()) < o.min_structures)
@@ -197,7 +246,7 @@ static std::vector<std::vector<int>> clusters(const Options &o, const Shard &sha
         std::sort(members.begin(), members.end());
         if (!shard.owns(points[members.front()]))
             return;
-        if (!o.cluster_square) {
+        if (window.circle) {
             bool legal = false;
             int fx = int(std::floor(x)), fz = int(std::floor(z));
             for (int ix = fx - 1; ix <= fx + 2 && !legal; ++ix)
@@ -205,7 +254,7 @@ static std::vector<std::vector<int>> clusters(const Options &o, const Shard &sha
                     legal = true;
                     for (int i : members) {
                         int64_t dx = int64_t(ix) - points[i].x, dz = int64_t(iz) - points[i].z;
-                        if (dx * dx + dz * dz > int64_t(o.cluster_radius) * o.cluster_radius) {
+                        if (dx * dx + dz * dz > int64_t(half_x) * half_x) {
                             legal = false;
                             break;
                         }
@@ -217,7 +266,7 @@ static std::vector<std::vector<int>> clusters(const Options &o, const Shard &sha
         if (unique.insert(members).second)
             found.push_back(std::move(members));
     };
-    if (!o.cluster_square) {
+    if (window.circle) {
         for (int i = 0; i < int(points.size()); ++i) {
             if ((i & 1023) == 0)
                 control.checkpoint();
@@ -246,13 +295,13 @@ static std::vector<std::vector<int>> clusters(const Options &o, const Shard &sha
             int nearby_count = 0;
             grid.nearby(a.x, a.z, [&](int j) {
                 auto p = points[j];
-                if (std::abs(int64_t(p.x) - a.x) <= o.cluster_radius * 2LL &&
-                    std::abs(int64_t(p.z) - a.z) <= o.cluster_radius * 2LL) {
+                if (std::abs(int64_t(p.x) - a.x) <= int64_t(half_x) * 2 &&
+                    std::abs(int64_t(p.z) - a.z) <= int64_t(half_z) * 2) {
                     ++nearby_count;
-                    xs.push_back(p.x - o.cluster_radius);
-                    xs.push_back(p.x + o.cluster_radius);
-                    zs.push_back(p.z - o.cluster_radius);
-                    zs.push_back(p.z + o.cluster_radius);
+                    xs.push_back(p.x - half_x);
+                    xs.push_back(p.x + half_x);
+                    zs.push_back(p.z - half_z);
+                    zs.push_back(p.z + half_z);
                 }
             });
             if (nearby_count < o.min_structures)
@@ -277,15 +326,17 @@ static std::vector<std::vector<int>> clusters(const Options &o, const Shard &sha
 
 Result optimize_center(const Options &o, const std::vector<Point> &structures, const std::vector<Vec3> &spawners,
                        Control *control) {
-    int r = o.cluster_radius, min_z = std::numeric_limits<int>::min(), max_z = std::numeric_limits<int>::max();
+    const auto window = cluster_window(o);
+    const int half_x = window.half_x, half_z = window.half_z;
+    int min_z = std::numeric_limits<int>::min(), max_z = std::numeric_limits<int>::max();
     for (auto p : structures) {
-        min_z = std::max(min_z, p.z - r);
-        max_z = std::min(max_z, p.z + r);
+        min_z = std::max(min_z, p.z - half_z);
+        max_z = std::min(max_z, p.z + half_z);
     }
-    std::vector<int> horizontal(r + 1, r);
-    if (!o.cluster_square)
-        for (int dz = 0; dz <= r; ++dz) {
-            int64_t value = int64_t(r) * r - int64_t(dz) * dz;
+    std::vector<int> horizontal(half_z + 1, half_x);
+    if (window.circle)
+        for (int dz = 0; dz <= half_z; ++dz) {
+            int64_t value = int64_t(half_x) * half_x - int64_t(dz) * dz;
             int h = int(std::sqrt(double(value)));
             while (int64_t(h + 1) * (h + 1) <= value)
                 ++h;
@@ -293,7 +344,7 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
                 --h;
             horizontal[dz] = h;
         }
-    std::vector<int> difference(2 * r + 3);
+    std::vector<int> difference(2 * half_x + 3);
     Result best{0, 0, int(structures.size()), -1, structures};
     for (int z = min_z; z <= max_z; ++z) {
         if (control && ((z - min_z) & 15) == 0)
@@ -301,7 +352,7 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
         int min_x = std::numeric_limits<int>::min(), max_x = std::numeric_limits<int>::max();
         for (auto p : structures) {
             int dz = std::abs(p.z - z);
-            if (dz > r) {
+            if (dz > half_z) {
                 min_x = 1;
                 max_x = 0;
                 break;
@@ -316,7 +367,7 @@ Result optimize_center(const Options &o, const std::vector<Point> &structures, c
         std::fill_n(difference.begin(), width + 1, 0);
         for (auto p : spawners) {
             int dz = std::abs(p.z - z);
-            if (dz > r)
+            if (dz > half_z)
                 continue;
             int h = horizontal[dz], from = std::max(min_x, p.x - h), to = std::min(max_x, p.x + h);
             if (from <= to) {
@@ -427,6 +478,23 @@ class Checkpoint {
                 hash = (hash ^ (value & 255)) * 1099511628211ULL;
                 value >>= 8;
             }
+        // 精确四至/矩形统计窗口只在启用时追加盐值，保持旧 center+radius 与旧统计窗口的断点文件名不变。
+        if (o.search_rect) {
+            const uint64_t rect[] = {1, uint64_t(o.min_x), uint64_t(o.max_x), uint64_t(o.min_z), uint64_t(o.max_z)};
+            for (auto value : rect)
+                for (int i = 0; i < 8; ++i) {
+                    hash = (hash ^ (value & 255)) * 1099511628211ULL;
+                    value >>= 8;
+                }
+        }
+        if (o.cluster_rect) {
+            const uint64_t window[] = {2, uint64_t(o.cluster_long), uint64_t(o.cluster_short)};
+            for (auto value : window)
+                for (int i = 0; i < 8; ++i) {
+                    hash = (hash ^ (value & 255)) * 1099511628211ULL;
+                    value >>= 8;
+                }
+        }
         std::filesystem::create_directories(o.checkpoint_directory);
         path_ = std::filesystem::path(o.checkpoint_directory) / ("native-v5-" + std::to_string(hash) + ".bin");
     }
@@ -541,17 +609,13 @@ static int64_t floor_sqrt64(int64_t value) {
 }
 
 static uint64_t covered_chunks(const Options &o) {
-    int lx = -30000000, hx = 29999999, lz = lx, hz = hx;
-    if (!o.full_world) {
-        lx = std::max(lx, o.center_x - o.radius);
-        hx = std::min(hx, o.center_x + o.radius);
-        lz = std::max(lz, o.center_z - o.radius);
-        hz = std::min(hz, o.center_z + o.radius);
-    }
+    const auto bounds = search_bounds(o);
+    int lx = bounds.min_x, hx = bounds.max_x, lz = bounds.min_z, hz = bounds.max_z;
     if (lx > hx || lz > hz)
         return 0;
     int64_t x0 = floor_div64(lx, 16), x1 = floor_div64(hx, 16), z0 = floor_div64(lz, 16), z1 = floor_div64(hz, 16);
-    if (o.full_world || o.search_square)
+    // 矩形四至、方形搜索和 full_world 都按区块矩形计；只有旧的圆形路径要逐列取圆内跨度。
+    if (o.full_world || o.search_rect || o.search_square)
         return uint64_t((x1 - x0 + 1) * (z1 - z0 + 1));
     // 圆形：逐区块列用列矩形到圆心的最近点求 z 跨度，不把外包方形的角算成覆盖。
     int64_t radius_sq = int64_t(o.radius) * o.radius, total = 0;
@@ -570,6 +634,10 @@ static uint64_t covered_chunks(const Options &o) {
 SearchOutput search(const Options &o, Control &control, const std::function<void(const Progress &)> &progress) {
     auto start = Clock::now();
     auto shards = make_shards(o);
+    const auto bounds = search_bounds(o);
+    const int center_x = bounds_center_x(o, bounds), center_z = bounds_center_z(o, bounds);
+    const auto window = cluster_window(o);
+    const int half_x = window.half_x, half_z = window.half_z;
     std::atomic<size_t> next{};
     std::mutex merge;
     Ranking ranking(ranking_capacity(o.result_limit), o.conversion_ratio);
@@ -643,7 +711,7 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                     spawners.erase(std::unique(spawners.begin(), spawners.end()), spawners.end());
                     auto result = optimize_center(o, structures, spawners, &control);
                     // 正式排名用的距离参照本次任务实际 bounds.center；组内几何优化仍只看覆盖率。
-                    result.distance_sq = squared_distance(result.x, result.z, o.center_x, o.center_z);
+                    result.distance_sq = squared_distance(result.x, result.z, center_x, center_z);
                     if (result.spawners >= o.min_spawners) {
                         std::sort(slow_spawners.begin(), slow_spawners.end());
                         slow_spawners.erase(std::unique(slow_spawners.begin(), slow_spawners.end()),
@@ -651,11 +719,11 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
                         for (auto p : slow_spawners) {
                             int64_t dx = int64_t(p.x) - result.x;
                             int64_t dz = int64_t(p.z) - result.z;
-                            if (o.cluster_square
-                                    ? (std::abs(dx) <= o.cluster_radius && std::abs(dz) <= o.cluster_radius)
-                                    : (dx * dx + dz * dz <= int64_t(o.cluster_radius) * o.cluster_radius)) {
+                            bool inside = window.circle
+                                ? (dx * dx + dz * dz <= int64_t(half_x) * half_x)
+                                : (std::abs(dx) <= half_x && std::abs(dz) <= half_z);
+                            if (inside)
                                 ++result.slow_spawners;
-                            }
                         }
                         result.fast_spawners = result.spawners - result.slow_spawners;
                         local.accept(std::move(result));

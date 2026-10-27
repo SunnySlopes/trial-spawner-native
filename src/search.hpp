@@ -10,7 +10,7 @@
 #include <string>
 
 #ifndef TRIAL_ENGINE_VERSION
-#define TRIAL_ENGINE_VERSION "3.0.2"
+#define TRIAL_ENGINE_VERSION "3.0.3"
 #endif
 
 namespace trial {
@@ -39,9 +39,17 @@ struct Options {
     int generation = 2, center_x = 0, center_z = 0, radius = 100000, cluster_radius = 128;
     int min_structures = 2, min_spawners = 20, threads = 8, result_limit = 0;
     int shard_size = 0;
+    // search_rect = true 时使用精确四至（闭区间）；否则沿用 center + radius + shape。
+    // 四至的排序中心取 (min+max)/2，与 bounds_json 的 center 一致。
+    bool search_rect = false;
+    int min_x = 0, max_x = 0, min_z = 0, max_z = 0;
     // 快速笼按 1 计，慢速笼按该比例折算；1.0 = 旧的总笼数排名。
     double conversion_ratio = 1.0;
     bool search_square = false, cluster_square = false, full_world = false;
+    // cluster_rect = true 时统计窗口使用 cluster_long × cluster_short（闭区间，居中）；
+    // false 时沿用 cluster_radius + cluster_square（圆/方）。
+    bool cluster_rect = false;
+    int cluster_long = 0, cluster_short = 0;
     std::string checkpoint_directory;
 };
 
