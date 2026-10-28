@@ -537,8 +537,14 @@ class Checkpoint {
                     value >>= 8;
                 }
         }
-        std::filesystem::create_directories(o.checkpoint_directory);
-        path_ = std::filesystem::path(o.checkpoint_directory) / ("native-v5-" + std::to_string(hash) + ".bin");
+        try {
+            std::filesystem::create_directories(o.checkpoint_directory);
+            path_ = std::filesystem::path(o.checkpoint_directory) /
+                    ("native-v5-" + std::to_string(hash) + ".bin");
+        } catch (const std::filesystem::filesystem_error &) {
+            // 断点只是加速/续跑功能；目录不可写时退化为本次不写断点，不能因此让搜索失败。
+            path_.clear();
+        }
     }
 
     bool done(size_t index) const {
@@ -550,40 +556,67 @@ class Checkpoint {
     }
 
     void load(Ranking &ranking, Progress &stats) {
-        if (path_.empty() || !std::filesystem::exists(path_))
+        if (path_.empty())
             return;
-        std::ifstream file(path_, std::ios::binary);
-        if (read_value<uint32_t>(file) != 0x54534635 || read_value<uint64_t>(file) != completed.size())
-            throw std::runtime_error("原生断点格式不匹配");
-        file.read(reinterpret_cast<char *>(completed.data()), std::streamsize(completed.size() * sizeof(uint64_t)));
-        stats.candidates = read_value<uint64_t>(file);
-        stats.layouts = read_value<uint64_t>(file);
-        stats.pruned = read_value<uint64_t>(file);
-        stats.elapsed_ms = read_value<double>(file);
-        auto size = read_value<uint32_t>(file);
-        for (uint32_t i = 0; i < size; ++i) {
-            Result r;
-            r.x = read_value<int>(file);
-            r.z = read_value<int>(file);
-            r.count = read_value<int>(file);
-            r.spawners = read_value<int>(file);
-            r.fast_spawners = read_value<int>(file);
-            r.slow_spawners = read_value<int>(file);
-            r.distance_sq = read_value<int64_t>(file);
-            for (int j = 0; j < r.count; ++j) {
-                Point p;
-                p.x = read_value<int>(file);
-                p.z = read_value<int>(file);
-                r.structures.push_back(p);
-            }
-            ranking.accept(std::move(r));
+        std::error_code existsError;
+        if (!std::filesystem::exists(path_, existsError)) {
+            if (existsError) path_.clear();
+            return;
         }
-        if (!file)
-            throw std::runtime_error("原生断点读取失败");
-        for (auto word : completed)
-            stats.completed += std::popcount(word);
-        stats.resumed = stats.completed;
-        stats.found = ranking.size();
+        try {
+            std::ifstream file(path_, std::ios::binary);
+            if (read_value<uint32_t>(file) != 0x54534635 || read_value<uint64_t>(file) != completed.size())
+                throw std::runtime_error("原生断点格式不匹配");
+            std::vector<uint64_t> loadedCompleted(completed.size());
+            file.read(reinterpret_cast<char *>(loadedCompleted.data()),
+                      std::streamsize(loadedCompleted.size() * sizeof(uint64_t)));
+            Progress loaded = stats;
+            loaded.candidates = read_value<uint64_t>(file);
+            loaded.layouts = read_value<uint64_t>(file);
+            loaded.pruned = read_value<uint64_t>(file);
+            loaded.elapsed_ms = read_value<double>(file);
+            auto size = read_value<uint32_t>(file);
+            if (size > 1000000)
+                throw std::runtime_error("原生断点结果数异常");
+            std::vector<Result> results;
+            results.reserve(size);
+            for (uint32_t i = 0; i < size; ++i) {
+                Result r;
+                r.x = read_value<int>(file);
+                r.z = read_value<int>(file);
+                r.count = read_value<int>(file);
+                r.spawners = read_value<int>(file);
+                r.fast_spawners = read_value<int>(file);
+                r.slow_spawners = read_value<int>(file);
+                r.distance_sq = read_value<int64_t>(file);
+                if (r.count < 0 || r.count > 32)
+                    throw std::runtime_error("原生断点结构数异常");
+                for (int j = 0; j < r.count; ++j) {
+                    Point p;
+                    p.x = read_value<int>(file);
+                    p.z = read_value<int>(file);
+                    r.structures.push_back(p);
+                }
+                results.push_back(std::move(r));
+            }
+            if (!file)
+                throw std::runtime_error("原生断点读取失败");
+            completed = std::move(loadedCompleted);
+            stats = loaded;
+            for (auto word : completed)
+                stats.completed += std::popcount(word);
+            stats.resumed = stats.completed;
+            for (auto &result : results)
+                ranking.accept(std::move(result));
+            stats.found = ranking.size();
+        } catch (const std::bad_alloc &) {
+            throw;
+        } catch (const std::exception &) {
+            // 旧版本或半截断点不能阻断本次搜索：删掉它并按全新任务继续。
+            std::error_code removeError;
+            std::filesystem::remove(path_, removeError);
+            path_.clear();
+        }
     }
 
     void save(const Ranking &ranking, const Progress &stats, bool force = false) {
@@ -591,41 +624,52 @@ class Checkpoint {
             return;
         auto temporary = path_;
         temporary += ".tmp";
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        write_value(file, uint32_t(0x54534635));
-        write_value(file, uint64_t(completed.size()));
-        file.write(reinterpret_cast<const char *>(completed.data()),
-                   std::streamsize(completed.size() * sizeof(uint64_t)));
-        write_value(file, stats.candidates);
-        write_value(file, stats.layouts);
-        write_value(file, stats.pruned);
-        write_value(file, stats.elapsed_ms);
-        auto results = ranking.results();
-        write_value(file, uint32_t(results.size()));
-        for (auto &r : results) {
-            write_value(file, r.x);
-            write_value(file, r.z);
-            write_value(file, r.count);
-            write_value(file, r.spawners);
-            write_value(file, r.fast_spawners);
-            write_value(file, r.slow_spawners);
-            write_value(file, r.distance_sq);
-            for (auto p : r.structures) {
-                write_value(file, p.x);
-                write_value(file, p.z);
+        try {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            if (!file)
+                throw std::runtime_error("原生断点写入失败");
+            write_value(file, uint32_t(0x54534635));
+            write_value(file, uint64_t(completed.size()));
+            file.write(reinterpret_cast<const char *>(completed.data()),
+                       std::streamsize(completed.size() * sizeof(uint64_t)));
+            write_value(file, stats.candidates);
+            write_value(file, stats.layouts);
+            write_value(file, stats.pruned);
+            write_value(file, stats.elapsed_ms);
+            auto results = ranking.results();
+            write_value(file, uint32_t(results.size()));
+            for (auto &r : results) {
+                write_value(file, r.x);
+                write_value(file, r.z);
+                write_value(file, r.count);
+                write_value(file, r.spawners);
+                write_value(file, r.fast_spawners);
+                write_value(file, r.slow_spawners);
+                write_value(file, r.distance_sq);
+                for (auto p : r.structures) {
+                    write_value(file, p.x);
+                    write_value(file, p.z);
+                }
             }
-        }
-        file.flush();
-        if (!file)
-            throw std::runtime_error("原生断点写入失败");
-        file.close();
+            file.flush();
+            if (!file)
+                throw std::runtime_error("原生断点写入失败");
+            file.close();
 #ifdef _WIN32
-        if (!MoveFileExW(temporary.c_str(), path_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            throw std::runtime_error("原生断点替换失败");
+            if (!MoveFileExW(temporary.c_str(), path_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                throw std::runtime_error("原生断点替换失败");
 #else
-        std::filesystem::rename(temporary, path_);
+            std::filesystem::rename(temporary, path_);
 #endif
-        saved_at_ = Clock::now();
+            saved_at_ = Clock::now();
+        } catch (const std::bad_alloc &) {
+            throw;
+        } catch (const std::exception &) {
+            // 断点写入失败（目录只读、被杀软占用等）不应让整个搜索失败。
+            std::error_code removeError;
+            std::filesystem::remove(temporary, removeError);
+            path_.clear();
+        }
     }
 
     std::string path() const {
