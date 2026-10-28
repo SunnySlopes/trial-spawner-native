@@ -124,6 +124,7 @@ class Control {
     std::condition_variable changed_;
     std::atomic<bool> paused_{};
     std::atomic<bool> cancelled_{};
+    std::atomic<bool> checkpoint_failed_{};
     std::chrono::steady_clock::time_point paused_at_{};
     std::chrono::steady_clock::duration paused_time_{};
 
@@ -136,6 +137,10 @@ class Control {
     bool running() const {
         return !paused_.load(std::memory_order_relaxed) && !cancelled_.load(std::memory_order_relaxed);
     }
+
+    // 暂停/停止时由 Checkpoint 回填；宿主用它提示“断点保存失败”。
+    void mark_checkpoint_failed() { checkpoint_failed_.store(true, std::memory_order_relaxed); }
+    bool checkpoint_failed() const { return checkpoint_failed_.load(std::memory_order_relaxed); }
 
     double elapsed_ms(std::chrono::steady_clock::time_point start);
     // 累计暂停毫秒，含当前尚未恢复的暂停段。

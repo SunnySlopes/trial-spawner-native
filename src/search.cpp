@@ -470,11 +470,13 @@ template <class T> static T read_value(std::istream &stream) {
 class Checkpoint {
     std::filesystem::path path_;
     Clock::time_point saved_at_ = Clock::now();
+    Control *control_ = nullptr;
 
   public:
     std::vector<uint64_t> completed;
 
-    Checkpoint(const Options &o, size_t count) : completed((count + 63) / 64) {
+    Checkpoint(const Options &o, size_t count, Control *control = nullptr)
+        : control_(control), completed((count + 63) / 64) {
         if (o.checkpoint_directory.empty())
             return;
         uint64_t hash = 1469598103934665603ULL;
@@ -544,6 +546,7 @@ class Checkpoint {
         } catch (const std::filesystem::filesystem_error &) {
             // 断点只是加速/续跑功能；目录不可写时退化为本次不写断点，不能因此让搜索失败。
             path_.clear();
+            if (control_) control_->mark_checkpoint_failed();
         }
     }
 
@@ -616,6 +619,7 @@ class Checkpoint {
             std::error_code removeError;
             std::filesystem::remove(path_, removeError);
             path_.clear();
+            if (control_) control_->mark_checkpoint_failed();
         }
     }
 
@@ -669,6 +673,7 @@ class Checkpoint {
             std::error_code removeError;
             std::filesystem::remove(temporary, removeError);
             path_.clear();
+            if (control_) control_->mark_checkpoint_failed();
         }
     }
 
@@ -731,7 +736,7 @@ SearchOutput search(const Options &o, Control &control, const std::function<void
     stats.total = shards.size();
     stats.chunks = covered_chunks(o);
     std::exception_ptr failure;
-    Checkpoint checkpoint(o, shards.size());
+    Checkpoint checkpoint(o, shards.size(), &control);
     checkpoint.load(ranking, stats);
     if (stats.resumed && progress)
         progress(stats);
