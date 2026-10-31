@@ -181,7 +181,9 @@ void Variant::connector_order(Random &random, std::vector<int> &order) const {
     }
 }
 
-Chamber LayoutEngine::generate(int cx, int cz) {
+Chamber LayoutEngine::generate(int cx, int cz, std::vector<PieceBox> *out_boxes) {
+    if (out_boxes)
+        out_boxes->clear();
     const auto &data = tables_.data;
     Random random(seed_);
     auto a = random.long_value(), b = random.long_value();
@@ -229,12 +231,19 @@ Chamber LayoutEngine::generate(int cx, int cz) {
     if (!allowed)
         return result;
     result.exists = true;
+    // 只有真实生成的密室才输出件盒；不存在时保持空数组，调用方不需要再判 exists。
+    int root_box_index = -1;
+    if (out_boxes) {
+        root_box_index = int(out_boxes->size());
+        out_boxes->push_back({root_box, false, -1});
+    }
 
     struct Piece {
         int id, rotation;
         Vec3 pos;
         Box box;
         bool slow{};
+        int box_index{-1};
     };
 
     struct Task {
@@ -260,24 +269,36 @@ Chamber LayoutEngine::generate(int cx, int cz) {
     root_space->occupy(root_box);
     std::map<int, std::deque<Task>, std::greater<int>> pending;
     Task task{{root_id, rotation, root_pos, root_box}, root_space, 0};
+    task.piece.box_index = root_box_index;
     auto &parents = parents_;
     auto &connectors = connectors_;
     auto &candidates = candidates_;
     auto &fallbacks = fallbacks_;
     // 慢速池先放连接件再放笼子；标记沿这条拼装分支传递，不额外消耗随机数。
-    auto collect_spawners = [&](const Variant &variant, Vec3 pos, bool slow) {
+    // 有笼子的件是 3×2×3 挂件，其父件是支架、祖父件才是宿主房间；固定两跳回溯。
+    auto collect_spawners = [&](const Variant &variant, Vec3 pos, bool slow, int box_index) {
         for (auto p : variant.spawners) {
             result.spawners.push_back(pos + p);
             if (slow) {
                 result.slow_spawners.push_back(pos + p);
             }
         }
+        if (out_boxes && box_index >= 0 && !variant.spawners.empty()) {
+            int host = (*out_boxes)[box_index].parent;
+            if (host >= 0)
+                host = (*out_boxes)[host].parent;
+            if (host < 0)
+                host = box_index; // 兜底：异常数据也至少落在本件上
+            (*out_boxes)[host].spawners += int(variant.spawners.size());
+            if (slow)
+                (*out_boxes)[host].slow_spawners += int(variant.spawners.size());
+        }
     };
     for (;;) {
         auto piece = task.piece;
         const auto &variant = tables_.variants[piece.id][piece.rotation];
         ++result.pieces;
-        collect_spawners(variant, piece.pos, piece.slow);
+        collect_spawners(variant, piece.pos, piece.slow, piece.box_index);
         variant.connector_order(random, parents);
         Space *internal = nullptr;
         for (int parent_index : parents) {
@@ -346,18 +367,25 @@ Chamber LayoutEngine::generate(int cx, int cz) {
                         if (!available->fits(box))
                             continue;
                         available->occupy(box);
+                        bool slow_branch = piece.slow || parent.pool == data.slow_spawner_pool;
+                        int box_index = -1;
+                        if (out_boxes) {
+                            box_index = int(out_boxes->size());
+                            out_boxes->push_back({box, slow_branch, piece.box_index});
+                        }
                         Piece placed{
                             child_id,
                             child_rotation,
                             pos,
                             box,
-                            piece.slow || parent.pool == data.slow_spawner_pool
+                            slow_branch,
+                            box_index
                         };
                         if (task.depth + 1 <= data.depth)
                             pending[parent.placement].push_back({placed, available, task.depth + 1});
                         else {
                             ++result.pieces;
-                            collect_spawners(child, pos, placed.slow);
+                            collect_spawners(child, pos, placed.slow, box_index);
                         }
                         attached = true;
                         break;

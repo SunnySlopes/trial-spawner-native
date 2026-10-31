@@ -3,8 +3,10 @@
 #include "range_units.hpp"
 #include "cli_config.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -58,15 +60,48 @@ static int generation_for(const std::string &version) {
     return generation_for_version(version);
 }
 
+static int midpoint(int a, int b) {
+    return int((int64_t(a) + int64_t(b)) / 2);
+}
+
 static void validate(const Options &o) {
     if (o.seed_text.empty())
         throw std::invalid_argument("种子不能为空");
-    if (o.radius < 1 || o.radius > 60000000 || o.cluster_radius < 1 || o.cluster_radius > 8192)
+    if (o.cluster_rect) {
+        if (o.cluster_long < 1 || o.cluster_long > 16384 || o.cluster_short < 1 || o.cluster_short > 16384)
+            throw std::invalid_argument("统计窗口长边/短边需为1–16384");
+    } else if (o.cluster_radius < 1 || o.cluster_radius > 8192) {
         throw std::invalid_argument("搜索范围或统计半径不合法");
-    if (o.center_x < -30000000 || o.center_x > 29999999 || o.center_z < -30000000 || o.center_z > 29999999)
-        throw std::invalid_argument("搜索中心超出世界边界");
+    }
+    if (!o.full_world) {
+        if (o.search_rect) {
+            if (o.min_x > o.max_x || o.min_z > o.max_z)
+                throw std::invalid_argument("搜索四至需满足 minX<=maxX 且 minZ<=maxZ");
+            if (o.min_x < -30000000 || o.max_x > 29999999 || o.min_z < -30000000 || o.max_z > 29999999)
+                throw std::invalid_argument("搜索四至超出世界边界");
+        } else {
+            if (o.radius < 1 || o.radius > 60000000)
+                throw std::invalid_argument("搜索范围或统计半径不合法");
+            if (o.center_x < -30000000 || o.center_x > 29999999 || o.center_z < -30000000 ||
+                o.center_z > 29999999)
+                throw std::invalid_argument("搜索中心超出世界边界");
+        }
+    }
     if (o.threads < 1 || o.threads > 32 || o.min_structures < 1 || o.min_spawners < 0 || o.result_limit < 0)
         throw std::invalid_argument("线程数需为1–32，筛选阈值需非负且密室数至少1");
+    if (o.max_structures < 0 || (o.max_structures > 0 && o.min_structures > o.max_structures))
+        throw std::invalid_argument("联数上限需为非负整数，且不能小于最低密室数");
+    if (!(o.conversion_ratio >= 0.0 && o.conversion_ratio <= 1.0))
+        throw std::invalid_argument("慢速笼折算比例需在0–1");
+    if (o.strict_margin < 0)
+        throw std::invalid_argument("严格模式边距需为非负整数");
+    if (o.strict_mode) {
+        // 结构起点要能从四边各缩进 strict_margin 格，窗口必须比它宽；否则内窗口为空。
+        const int half_x = o.cluster_rect ? o.cluster_long / 2 : o.cluster_radius;
+        const int half_z = o.cluster_rect ? o.cluster_short / 2 : o.cluster_radius;
+        if (half_x <= o.strict_margin || half_z <= o.strict_margin)
+            throw std::invalid_argument("严格模式要求统计窗口半宽大于边距（长/短边>2×边距，或半径>边距）");
+    }
 }
 
 static bool square_shape(const std::string &shape) {
@@ -78,19 +113,38 @@ static bool square_shape(const std::string &shape) {
 }
 
 static Json bounds_json(const Options &o) {
-    return {{"centerX", o.center_x},
-            {"centerZ", o.center_z},
-            {"radiusBlocks", o.radius},
-            {"shape", o.search_square ? "square" : "circle"},
-            {"fullWorld", o.full_world}};
+    const bool rect = o.search_rect;
+    Json out = {{"centerX", rect ? midpoint(o.min_x, o.max_x) : o.center_x},
+                {"centerZ", rect ? midpoint(o.min_z, o.max_z) : o.center_z},
+                {"radiusBlocks", o.radius},
+                {"shape", rect ? "rect" : (o.search_square ? "square" : "circle")},
+                {"fullWorld", o.full_world}};
+    if (rect) {
+        out["minX"] = o.min_x;
+        out["maxX"] = o.max_x;
+        out["minZ"] = o.min_z;
+        out["maxZ"] = o.max_z;
+    }
+    return out;
 }
 
 static Json params_json(const Options &o) {
-    return {{"clusterRadiusBlocks", o.cluster_radius},
-            {"clusterShape", o.cluster_square ? "square" : "circle"},
-            {"minStructures", o.min_structures},
-            {"minSpawners", o.min_spawners},
-            {"generation", std::to_string(o.generation)}};
+    Json out = {{"clusterRadiusBlocks", o.cluster_radius},
+                {"clusterShape", o.cluster_rect ? "rect" : (o.cluster_square ? "square" : "circle")},
+                {"minStructures", o.min_structures},
+                {"minSpawners", o.min_spawners},
+                {"generation", std::to_string(o.generation)},
+                {"conversionRatio", o.conversion_ratio},
+                {"strictMode", o.strict_mode}};
+    if (o.strict_mode)
+        out["strictMargin"] = o.strict_margin;
+    if (o.max_structures > 0)
+        out["maxStructures"] = o.max_structures;
+    if (o.cluster_rect) {
+        out["clusterLongSide"] = o.cluster_long;
+        out["clusterShortSide"] = o.cluster_short;
+    }
+    return out;
 }
 
 // 展示距离统一在这里取整到一位小数，CSV/TXT/JSON 三个出口共用同一数值，避免各自格式化后出现 0.1 的差。
@@ -98,7 +152,7 @@ static double distance_of(const Result &r) {
     return std::round(std::sqrt(double(r.distance_sq)) * 10) / 10;
 }
 
-static Json candidate_json(const Result &r, int rank) {
+static Json candidate_json(const Result &r, int rank, double conversion_ratio) {
     uint64_t h = 1469598103934665603ULL;
     Json structures = Json::array();
     for (auto p : r.structures) {
@@ -114,6 +168,8 @@ static Json candidate_json(const Result &r, int rank) {
             {"score", r.spawners},
             {"fastSpawnerCount", r.fast_spawners},
             {"slowSpawnerCount", r.slow_spawners},
+            {"convertedSpawnerCount", converted_spawners(r, conversion_ratio)},
+            {"conversionRatio", conversion_ratio},
             {"scoreUnit", "刷怪笼"},
             {"distance", distance_of(r)},
             {"distanceSq", r.distance_sq},
@@ -128,7 +184,7 @@ static Json result_json(const Options &o, const SearchOutput &output, const std:
     Json candidates = Json::array();
     int rank = 0;
     for (const auto &r : output.results)
-        candidates.push_back(candidate_json(r, ++rank));
+        candidates.push_back(candidate_json(r, ++rank, o.conversion_ratio));
     int64_t search_ms = int64_t(std::llround(output.stats.elapsed_ms));
     return {{"jobId", job},
             {"protocolVersion", protocol_version},
@@ -247,8 +303,26 @@ static Options from_config(const Json &config) {
     o.center_x = bounds.value("centerX", 0);
     o.center_z = bounds.value("centerZ", 0);
     o.radius = range_units::field(bounds, "radius", "radiusBlocks", 100000);
-    o.search_square = square_shape(bounds.at("shape").get<std::string>());
     o.full_world = bounds.value("fullWorld", false);
+    // 新协议可选携带精确四至；四个键必须同时出现。shape=rect 只在有四至时出现。
+    const bool has_rect = bounds.contains("minX") || bounds.contains("maxX") || bounds.contains("minZ") ||
+                          bounds.contains("maxZ");
+    if (has_rect) {
+        if (!bounds.contains("minX") || !bounds.contains("maxX") || !bounds.contains("minZ") ||
+            !bounds.contains("maxZ"))
+            throw std::invalid_argument("精确四至需同时提供 minX/maxX/minZ/maxZ");
+        o.search_rect = true;
+        o.min_x = bounds.at("minX");
+        o.max_x = bounds.at("maxX");
+        o.min_z = bounds.at("minZ");
+        o.max_z = bounds.at("maxZ");
+        o.center_x = midpoint(o.min_x, o.max_x);
+        o.center_z = midpoint(o.min_z, o.max_z);
+        o.radius = std::max(o.max_x - o.min_x, o.max_z - o.min_z) / 2 + 1;
+        o.search_square = true;
+    } else {
+        o.search_square = square_shape(bounds.value("shape", std::string("circle")));
+    }
     o.threads = config.value("threads", 8);
     o.result_limit = config.value("resultLimit", 0);
     if (o.result_limit < 1 || o.result_limit > 200)
@@ -256,10 +330,25 @@ static Options from_config(const Json &config) {
     const auto &params = config.at("params");
     o.generation = generation_for(params.value("generation", std::string("2")));
     o.cluster_radius = range_units::field(params, "clusterRadius", "clusterRadiusBlocks", 128);
+    const bool has_window = params.contains("clusterLongSide") || params.contains("clusterShortSide");
+    if (has_window) {
+        if (!params.contains("clusterLongSide") || !params.contains("clusterShortSide"))
+            throw std::invalid_argument("矩形统计窗口需同时提供 clusterLongSide/clusterShortSide");
+        o.cluster_rect = true;
+        o.cluster_long = params.at("clusterLongSide");
+        o.cluster_short = params.at("clusterShortSide");
+        o.cluster_radius = std::max(o.cluster_long, o.cluster_short) / 2;
+        o.cluster_square = false;
+    } else {
+        // v3 用 clusterShape 表达统计形状；旧配置里的 mode 已无执行语义，直接忽略。
+        o.cluster_square = square_shape(params.value("clusterShape", std::string("square")));
+    }
     o.min_structures = params.value("minStructures", 2);
     o.min_spawners = params.value("minSpawners", 20);
-    // v3 用 clusterShape 表达统计形状；旧配置里的 mode 已无执行语义，直接忽略。
-    o.cluster_square = square_shape(params.value("clusterShape", std::string("square")));
+    o.max_structures = params.value("maxStructures", 0);
+    o.conversion_ratio = params.value("conversionRatio", 1.0);
+    o.strict_mode = params.value("strictMode", false);
+    o.strict_margin = params.value("strictMargin", default_strict_margin);
     o.checkpoint_directory = "config/checkpoints/trial-native";
     validate(o);
     return o;
@@ -473,22 +562,29 @@ static int run(int argc, char **argv) {
                              "通用: --config finder.json --version 26.3 --radius 100000 --shape circle|square\n"
                              "      --center-x 0 --center-z 0 --threads 8 --limit 100 --output results\n"
                              "      --radius-unit blocks|chunks --full-world --no-checkpoint\n"
+                             "      --min-x/--max-x/--min-z/--max-z 精确四至（四个同时给出，覆盖中心与半径）\n"
                              "统计: --cluster-radius 128 --cluster-radius-unit blocks|chunks --cluster-shape circle|square\n"
-                             "      --min-structures 2 --min-spawners 20\n"
+                             "      --cluster-long/--cluster-short 矩形统计窗口（同时给出，覆盖统计半径）\n"
+                             "      --min-structures 2 --min-spawners 20（窗口内最低等效笼数，非快慢总数）\n"
+                             "      --conversion-ratio 1.0 慢速笼折算比例；等效笼数=fast+slow*ratio，即排名键\n"
+                             "      --strict-mode --strict-margin 0 严格模式内缩格数；笼数仍按完整窗口统计\n"
+                             "      --max-structures 0 每组参与统计的密室数上限，0=不限制\n"
                              "桌面: --desktop (协议v3，stdin/stdout JSONL，不读取CLI配置)\n"
                              "开发: --chunk-x 区块X --chunk-z 区块Z；--limit 0保留旧分组榜单\n"
                              "配置键为CLI参数名去掉--，命令行覆盖配置；输出目录由--output指定。\n";
                 return 0;
             }
             const std::vector<std::string> names = {
-                "--radius-unit", "--cluster-radius-unit",
-                "--seed",           "--version",        "--generation",   "--radius",  "--cluster-radius", "--shape",
-                "--cluster-shape",  "--min-structures", "--min-spawners", "--threads", "--limit",          "--center-x",
+                "--radius-unit",  "--cluster-radius-unit", "--seed",           "--version",
+                "--generation",   "--radius",              "--min-x",          "--max-x",
+                "--min-z",        "--max-z",               "--shape",          "--cluster-radius",
+                "--cluster-long", "--cluster-short",       "--cluster-shape",  "--min-structures",
+                "--min-spawners", "--threads",             "--limit",          "--conversion-ratio",
                 "--center-z",       "--output",         "--full-world",   "--chunk-x", "--chunk-z",        "--config",
-                "--checkpoint-dir", "--no-checkpoint",  "--finder"};
+                "--checkpoint-dir", "--no-checkpoint",  "--strict-mode",  "--strict-margin", "--max-structures", "--finder"};
             if (std::find(names.begin(), names.end(), name) == names.end())
                 throw std::invalid_argument("未知参数：" + name);
-            if (name == "--full-world" || name == "--no-checkpoint")
+            if (name == "--full-world" || name == "--no-checkpoint" || name == "--strict-mode")
                 args[name] = "true";
             else {
                 if (i + 1 == command.size())
@@ -511,19 +607,61 @@ static int run(int argc, char **argv) {
                 throw std::invalid_argument("参数需为整数：" + name);
             return number;
         };
+        auto real = [&](const std::string &name, double value) {
+            auto input = text(name, std::to_string(value));
+            char *end = nullptr;
+            errno = 0;
+            const double number = std::strtod(input.c_str(), &end);
+            if (errno == ERANGE || !end || *end != '\0')
+                throw std::invalid_argument("参数需为数字：" + name);
+            return number;
+        };
         o.seed_text = text("--seed", "0");
         o.seed = parse_seed(o.seed_text);
         o.generation = generation_for(text("--version", text("--generation", "2")));
-        o.center_x = integer("--center-x", 0);
-        o.center_z = integer("--center-z", 0);
-        o.radius = range_units::text(text("--radius", "100000"), text("--radius-unit", "blocks"));
-        o.cluster_radius = range_units::text(text("--cluster-radius", "128"), text("--cluster-radius-unit", "blocks"));
+        const bool has_rect = args.contains("--min-x") || args.contains("--max-x") || args.contains("--min-z") ||
+                              args.contains("--max-z");
+        if (has_rect) {
+            if (!args.contains("--min-x") || !args.contains("--max-x") || !args.contains("--min-z") ||
+                !args.contains("--max-z"))
+                throw std::invalid_argument("精确四至需同时提供 --min-x/--max-x/--min-z/--max-z");
+            o.search_rect = true;
+            o.min_x = integer("--min-x", 0);
+            o.max_x = integer("--max-x", 0);
+            o.min_z = integer("--min-z", 0);
+            o.max_z = integer("--max-z", 0);
+            o.center_x = midpoint(o.min_x, o.max_x);
+            o.center_z = midpoint(o.min_z, o.max_z);
+            o.radius = std::max(o.max_x - o.min_x, o.max_z - o.min_z) / 2 + 1;
+            o.search_square = true;
+        } else {
+            o.center_x = integer("--center-x", 0);
+            o.center_z = integer("--center-z", 0);
+            o.radius = range_units::text(text("--radius", "100000"), text("--radius-unit", "blocks"));
+            o.search_square = square_shape(text("--shape", "circle"));
+        }
+        const bool has_window = args.contains("--cluster-long") || args.contains("--cluster-short");
+        if (has_window) {
+            if (!args.contains("--cluster-long") || !args.contains("--cluster-short"))
+                throw std::invalid_argument("矩形统计窗口需同时提供 --cluster-long/--cluster-short");
+            o.cluster_rect = true;
+            o.cluster_long = range_units::text(text("--cluster-long", "320"), text("--cluster-radius-unit", "blocks"));
+            o.cluster_short = range_units::text(text("--cluster-short", "320"), text("--cluster-radius-unit", "blocks"));
+            o.cluster_radius = std::max(o.cluster_long, o.cluster_short) / 2;
+            o.cluster_square = false;
+        } else {
+            o.cluster_radius =
+                range_units::text(text("--cluster-radius", "128"), text("--cluster-radius-unit", "blocks"));
+            o.cluster_square = square_shape(text("--cluster-shape", "circle"));
+        }
         o.min_structures = integer("--min-structures", 2);
         o.min_spawners = integer("--min-spawners", 20);
+        o.max_structures = integer("--max-structures", 0);
         o.threads = integer("--threads", 8);
         o.result_limit = integer("--limit", 100);
-        o.search_square = square_shape(text("--shape", "circle"));
-        o.cluster_square = square_shape(text("--cluster-shape", "circle"));
+        o.conversion_ratio = real("--conversion-ratio", 1.0);
+        o.strict_mode = text("--strict-mode", "false") == "true";
+        o.strict_margin = integer("--strict-margin", default_strict_margin);
         o.full_world = args.contains("--full-world");
         validate(o);
         if (!args.contains("--no-checkpoint"))
@@ -532,16 +670,32 @@ static int run(int argc, char **argv) {
         if (args.contains("--chunk-x") || args.contains("--chunk-z")) {
             LayoutEngine engine(o.generation, o.seed);
             int x = integer("--chunk-x", 0), z = integer("--chunk-z", 0);
-            auto chamber = engine.generate(x, z);
+            std::vector<PieceBox> boxes;
+            auto chamber = engine.generate(x, z, &boxes);
             Json out = {{"seed", o.seed_text},
                         {"generation", o.generation},
                         {"chunkX", x},
                         {"chunkZ", z},
                         {"exists", chamber.exists},
                         {"pieces", chamber.pieces},
-                        {"spawners", Json::array()}};
+                        {"spawners", Json::array()},
+                        {"slowSpawners", Json::array()},
+                        {"boxes", Json::array()}};
             for (auto p : chamber.spawners)
                 out["spawners"].push_back({p.x, p.y, p.z});
+            for (auto p : chamber.slow_spawners)
+                out["slowSpawners"].push_back({p.x, p.y, p.z});
+            for (auto &b : boxes)
+                out["boxes"].push_back({{"minX", b.box.lo.x},
+                                        {"minY", b.box.lo.y},
+                                        {"minZ", b.box.lo.z},
+                                        {"maxX", b.box.hi.x},
+                                        {"maxY", b.box.hi.y},
+                                        {"maxZ", b.box.hi.z},
+                                        {"slow", b.slow},
+                                        {"parent", b.parent},
+                                        {"spawners", b.spawners},
+                                        {"slowSpawners", b.slow_spawners}});
             std::cout << out.dump() << '\n';
             return 0;
         }
