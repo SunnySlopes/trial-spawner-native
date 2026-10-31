@@ -32,6 +32,8 @@ inline int ranking_capacity(int result_limit) {
     return result_limit > 0 ? std::max(100, result_limit) : 100;
 }
 
+int generation_for_version(const std::string &version);
+
 struct Options {
     uint64_t seed{};
     std::string seed_text = "0";

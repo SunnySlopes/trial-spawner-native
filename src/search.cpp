@@ -9,6 +9,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -22,6 +23,20 @@
 
 namespace trial {
 using Clock = std::chrono::steady_clock;
+
+int generation_for_version(const std::string &version) {
+    if (version == "3" || version == "26.3")
+        return 3;
+    if (version == "1" || version == "1.21" || version == "1.21.1")
+        return 1;
+    constexpr const char *modern[] = {"2",      "1.21.2",  "1.21.3",  "1.21.4", "1.21.5", "1.21.6", "1.21.7", "1.21.8",
+                                      "1.21.9", "1.21.10", "1.21.11", "26.1",   "26.1.1", "26.1.2", "26.2"};
+    for (auto supported : modern)
+        if (version == supported)
+            return 2;
+    throw std::invalid_argument("支持生成代际1/2/3及Minecraft 1.21–26.3");
+}
+
 
 void Control::checkpoint() {
     if (cancelled_.load(std::memory_order_relaxed))
@@ -410,6 +425,7 @@ class Checkpoint {
                                    uint64_t(o.cluster_square),
                                    uint64_t(o.full_world),
                                    uint64_t(ranking_rule_version),
+                                   CUBIOMES_FINGERPRINT,
                                    uint64_t(ranking_capacity(o.result_limit))};
         for (auto value : values)
             for (int i = 0; i < 8; ++i) {

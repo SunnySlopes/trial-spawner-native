@@ -154,7 +154,7 @@ bool LayoutEngine::Space::fits(Box box) {
 }
 
 LayoutEngine::LayoutEngine(int generation, uint64_t seed)
-    : tables_(tables(generation)), seed_(seed), biomes_(trial_biomes_create(seed), trial_biomes_free),
+    : tables_(tables(generation)), seed_(seed), biomes_(generation < 3 ? trial_biomes_create(seed) : nullptr, trial_biomes_free),
       aliases_(tables_.data.pools.size()), rejected_(tables_.data.templates.size()) {
     if (generation >= 3)
         climate263_ = std::make_unique<Climate263>(seed);
