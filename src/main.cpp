@@ -288,6 +288,9 @@ static Json progress_json(const Progress &p, const std::string &phase, const std
                                                       : "原生布局计算与聚类精排"}};
     if (p.total > 0)
         event["overallPercentage"] = std::round(percentage * 10) / 10;
+    // 已扫描区块按完成分片比例折算：分片是唯一可靠的进度口径，区块数只是给界面看的量纲。
+    if (p.total > 0 && p.chunks > 0)
+        event["scannedChunks"] = int64_t(p.chunks * p.completed / p.total);
     return event;
 }
 
@@ -349,6 +352,10 @@ static int protocol() {
                                 last_progress = now;
                             }
                         });
+                        // 节流会吞掉最后一帧，这里补发一次粗筛末帧，保证阶段能显示到 100%。
+                        emit({{"type", "progress"},
+                              {"jobId", current_job},
+                              {"progress", progress_json(output.stats, "coarse", "running")}});
                         current_control->checkpoint();
                         // totalMs 加上断点恢复的历史累计，
                         // 保证它与同样含历史累计的 searchMs 可比；不把 CPU 核心时间相加。

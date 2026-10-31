@@ -34,7 +34,7 @@ add_library(MinecraftFinders::Trial ALIAS trial_layout)
 target_include_directories(trial_layout PUBLIC include src PRIVATE data)
 target_compile_features(trial_layout PUBLIC cxx_std_20)
 target_link_libraries(trial_layout PUBLIC biomes Threads::Threads)
-target_compile_definitions(trial_layout PUBLIC TRIAL_ENGINE_VERSION="3.1.1")
+target_compile_definitions(trial_layout PUBLIC TRIAL_ENGINE_VERSION="3.1.2")
 target_compile_options(biomes PRIVATE -O3 -fwrapv -ffp-contract=off -ffunction-sections -fdata-sections)
 target_compile_options(trial_layout PRIVATE -O3 -Wall -Wextra -ffp-contract=off -ffunction-sections -fdata-sections)
 
