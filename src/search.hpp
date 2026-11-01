@@ -33,6 +33,8 @@ inline int ranking_capacity(int result_limit) {
     return result_limit > 0 ? std::max(100, result_limit) : 100;
 }
 
+int generation_for_version(const std::string &version);
+
 // 严格模式默认的内缩格数；实际值由 CLI / 配置 / 协议参数覆盖。
 inline constexpr int default_strict_margin = 0;
 

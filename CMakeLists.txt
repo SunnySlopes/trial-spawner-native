@@ -1,43 +1,65 @@
 cmake_minimum_required(VERSION 3.20)
 project(trial_spawner_native LANGUAGES C CXX)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CUBIOMES third_party/cubiomes)
-add_library(biomes STATIC src/biome_bridge.c ${CUBIOMES}/generator.c ${CUBIOMES}/biomenoise.c ${CUBIOMES}/biomes.c
-                          ${CUBIOMES}/layers.c ${CUBIOMES}/noise.c)
-target_include_directories(biomes PUBLIC ${CUBIOMES})
+find_package(Threads REQUIRED)
+
+set(standalone OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(standalone ON)
+endif()
+option(TRIAL_BUILD_CLI "构建独立命令行与桌面协议程序" ${standalone})
+option(TRIAL_ENABLE_IPO "发布构建启用跨文件链接优化" ${TRIAL_BUILD_CLI})
+if(TRIAL_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ipo_available OUTPUT ipo_reason)
+    if(ipo_available)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    else()
+        message(STATUS "链接优化不可用，保留普通优化：${ipo_reason}")
+    endif()
+endif()
+
+include(third_party/cubiomes/cmake/CubiomesModules.cmake)
+cubiomes_add_modules(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cubiomes"
+    PREFIX TrialCubiomes LOCK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cubiomes-lock.json"
+    MODULES Biomes)
+
+add_library(biomes STATIC src/biome_bridge.c)
+target_link_libraries(biomes PUBLIC TrialCubiomes::Biomes)
 add_library(trial_layout STATIC src/layout.cpp src/search.cpp src/climate263.cpp)
-target_include_directories(trial_layout PUBLIC src data)
-# 桌面契约 SearchResult.engineVersion；协议/排名规则或二进制行为变化时同步。
-target_compile_definitions(trial_layout PUBLIC TRIAL_ENGINE_VERSION="3.0.3")
-target_link_libraries(trial_layout PUBLIC biomes)
-add_executable(trial-spawner src/main.cpp)
-target_include_directories(trial-spawner PRIVATE third_party)
-target_link_libraries(trial-spawner PRIVATE trial_layout)
-if(MSVC)
-    set_property(TARGET biomes trial_layout trial-spawner PROPERTY MSVC_RUNTIME_LIBRARY
-                                                                   "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    target_compile_options(trial-spawner PRIVATE /utf-8)
-    target_compile_options(trial_layout PRIVATE /O2 /fp:strict /utf-8)
-else()
-    target_compile_options(biomes PRIVATE -O3 -fwrapv -ffp-contract=off -ffunction-sections -fdata-sections)
-    target_compile_options(trial_layout PRIVATE -O3 -Wall -Wextra -ffp-contract=off -ffunction-sections -fdata-sections)
-    target_link_options(
-        trial-spawner
-        PRIVATE
-        -static
-        -static-libgcc
-        -static-libstdc++
-        -Wl,--gc-sections
-        -s)
+add_library(MinecraftFinders::Trial ALIAS trial_layout)
+target_include_directories(trial_layout PUBLIC include src PRIVATE data)
+target_compile_features(trial_layout PUBLIC cxx_std_20)
+target_link_libraries(trial_layout PUBLIC biomes Threads::Threads)
+target_compile_definitions(trial_layout PUBLIC TRIAL_ENGINE_VERSION="3.1.2")
+target_compile_options(biomes PRIVATE -O3 -fwrapv -ffp-contract=off -ffunction-sections -fdata-sections)
+target_compile_options(trial_layout PRIVATE -O3 -Wall -Wextra -ffp-contract=off -ffunction-sections -fdata-sections)
+
+if(TRIAL_BUILD_CLI)
+    add_executable(trial-spawner src/main.cpp)
+    target_include_directories(trial-spawner PRIVATE third_party)
+    target_link_libraries(trial-spawner PRIVATE MinecraftFinders::Trial)
+    target_link_options(trial-spawner PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -s)
     if(WIN32)
         target_link_options(trial-spawner PRIVATE -municode)
     endif()
 endif()
+
+option(TRIAL_BUILD_EXAMPLE "构建直接调用算法库的示例" OFF)
+if(TRIAL_BUILD_EXAMPLE)
+    add_executable(trial-example examples/basic.cpp)
+    target_link_libraries(trial-example PRIVATE MinecraftFinders::Trial)
+    if(WIN32)
+        target_link_options(trial-example PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+endif()
+
 option(BUILD_TESTING "Build local regression tests" OFF)
 include(CTest)
-if(BUILD_TESTING)
+if(BUILD_TESTING AND TRIAL_BUILD_CLI)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit.cpp")
         message(FATAL_ERROR "Local tests/ is not included in this repository. Use -DBUILD_TESTING=OFF to build the engine.")
     endif()
@@ -66,6 +88,7 @@ if(BUILD_TESTING)
     add_test(NAME unit COMMAND trial-unit)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
+        add_test(NAME cli-config COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_config.py $<TARGET_FILE:trial-spawner>)
         add_test(NAME versions26 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/version26_check.py
                                          $<TARGET_FILE:trial-spawner>)
         add_test(NAME climate263 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/climate263_check.py

@@ -1,5 +1,7 @@
 #include "search.hpp"
 #include "json.hpp"
+#include "range_units.hpp"
+#include "cli_config.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -55,16 +57,7 @@ static uint64_t parse_seed(const std::string &text) {
 }
 
 static int generation_for(const std::string &version) {
-    if (version == "3" || version == "26.3")
-        return 3;
-    if (version == "1" || version == "1.21" || version == "1.21.1")
-        return 1;
-    constexpr const char *modern[] = {"2",      "1.21.2",  "1.21.3",  "1.21.4", "1.21.5", "1.21.6", "1.21.7", "1.21.8",
-                                      "1.21.9", "1.21.10", "1.21.11", "26.1",   "26.1.1", "26.1.2", "26.2"};
-    for (auto supported : modern)
-        if (version == supported)
-            return 2;
-    throw std::invalid_argument("支持生成代际1/2/3及Minecraft 1.21–26.3");
+    return generation_for_version(version);
 }
 
 static int midpoint(int a, int b) {
@@ -202,6 +195,7 @@ static Json result_json(const Options &o, const SearchOutput &output, const std:
             {"finderGeneration", std::to_string(o.generation)},
             {"engine", engine_name},
             {"engineVersion", engine_version},
+            {"cubiomesCommit", CUBIOMES_REVISION},
             {"bounds", bounds_json(o)},
             {"params", params_json(o)},
             {"threads", o.threads},
@@ -237,8 +231,10 @@ static Json write_results(const Options &o, const SearchOutput &output, const fs
     std::ostringstream timestamp;
     timestamp << std::put_time(&time, "%Y%m%d-%H%M%S");
     fs::path base = directory / ("results-trial-spawner-" + timestamp.str());
+    auto named = [&](const std::string &ext) { auto path = base; path += ext; return path; };
+    auto pathText = [](const fs::path &path) { auto text = path.u8string(); return std::string(text.begin(), text.end()); };
     int suffix = 1;
-    while (fs::exists(base.string() + ".csv"))
+    while (fs::exists(named(".csv")))
         base = directory / ("results-trial-spawner-" + timestamp.str() + "-" + std::to_string(++suffix));
     std::ostringstream csv, txt;
     csv << "\xef\xbb\xbf排名;距搜索中心距离;中心X;中心Z;密室数量;试炼刷怪笼数量;密室位置\n";
@@ -274,12 +270,12 @@ static Json write_results(const Options &o, const SearchOutput &output, const fs
     if (exports) {
         *exports = {{"csv", csv.str()}, {"txt", txt.str()}, {"json", result.dump(2) + "\n"}};
     } else {
-        result["output"] = {{"csvPath", fs::absolute(base.string() + ".csv").string()},
-                            {"txtPath", fs::absolute(base.string() + ".txt").string()},
-                            {"jsonPath", fs::absolute(base.string() + ".json").string()}};
+        result["output"] = {{"csvPath", pathText(fs::absolute(named(".csv")))},
+                            {"txtPath", pathText(fs::absolute(named(".txt")))},
+                            {"jsonPath", pathText(fs::absolute(named(".json")))}};
         for (const auto &[ext, content] : std::map<std::string, std::string>{
                  {"csv", csv.str()}, {"txt", txt.str()}, {"json", result.dump(2) + "\n"}}) {
-            std::ofstream file(base.string() + "." + ext, std::ios::binary);
+            std::ofstream file(named("." + ext), std::ios::binary);
             file << content;
             file.close();
             if (!file)
@@ -306,7 +302,7 @@ static Options from_config(const Json &config) {
     const auto &bounds = config.at("bounds");
     o.center_x = bounds.value("centerX", 0);
     o.center_z = bounds.value("centerZ", 0);
-    o.radius = bounds.value("radiusBlocks", 100000);
+    o.radius = range_units::field(bounds, "radius", "radiusBlocks", 100000);
     o.full_world = bounds.value("fullWorld", false);
     // 新协议可选携带精确四至；四个键必须同时出现。shape=rect 只在有四至时出现。
     const bool has_rect = bounds.contains("minX") || bounds.contains("maxX") || bounds.contains("minZ") ||
@@ -333,7 +329,7 @@ static Options from_config(const Json &config) {
         throw std::invalid_argument("结果数量需为1–200");
     const auto &params = config.at("params");
     o.generation = generation_for(params.value("generation", std::string("2")));
-    o.cluster_radius = params.value("clusterRadiusBlocks", 128);
+    o.cluster_radius = range_units::field(params, "clusterRadius", "clusterRadiusBlocks", 128);
     const bool has_window = params.contains("clusterLongSide") || params.contains("clusterShortSide");
     if (has_window) {
         if (!params.contains("clusterLongSide") || !params.contains("clusterShortSide"))
@@ -381,6 +377,9 @@ static Json progress_json(const Progress &p, const std::string &phase, const std
                                                       : "原生布局计算与聚类精排"}};
     if (p.total > 0)
         event["overallPercentage"] = std::round(percentage * 10) / 10;
+    // 已扫描区块按完成分片比例折算：分片是唯一可靠的进度口径，区块数只是给界面看的量纲。
+    if (p.total > 0 && p.chunks > 0)
+        event["scannedChunks"] = int64_t(p.chunks * p.completed / p.total);
     return event;
 }
 
@@ -442,6 +441,10 @@ static int protocol() {
                                 last_progress = now;
                             }
                         });
+                        // 节流会吞掉最后一帧，这里补发一次粗筛末帧，保证阶段能显示到 100%。
+                        emit({{"type", "progress"},
+                              {"jobId", current_job},
+                              {"progress", progress_json(output.stats, "coarse", "running")}});
                         current_control->checkpoint();
                         // totalMs 加上断点恢复的历史累计，
                         // 保证它与同样含历史累计的 searchMs 可比；不把 CPU 核心时间相加。
@@ -529,7 +532,13 @@ static int protocol() {
         }
     }
     if (worker.joinable()) {
-        control->cancel();
+        /* ⚠️ 不要在这里 cancel。
+         *
+         * 曾经写成「stdin 一关闭就 cancel()」，结果单行 start 输入（stdin 立即 EOF）
+         * 的任务刚跑完就被判成 cancelled，done 帧缺失、桌面端把它当失败。
+         * 桌面端在任务结束前一直持有 stdin；即使提前 EOF 也应等任务**自然跑完**。
+         * 取消是显式命令，不能由 EOF 隐式触发。
+         * 女巫小屋与河流引擎的协议里也踩过同一个坑，修法一致。 */
         worker.join();
     }
     return 0;
@@ -537,35 +546,40 @@ static int protocol() {
 
 static int run(int argc, char **argv) {
     try {
+        std::vector<std::string> input(argv + 1, argv + argc);
+        for (const auto &name : input)
+            if (name == "--desktop" || name == "--jsonl")
+                return protocol();
+        auto command = cli_config::arguments(input);
         std::map<std::string, std::string> args;
-        for (int i = 1; i < argc; ++i) {
-            std::string name = argv[i];
+        for (size_t i = 0; i < command.size(); ++i) {
+            const auto &name = command[i];
             if (name == "--jsonl")
                 return protocol();
             if (name == "--help") {
-                std::cout << "trial-spawner --seed <seed> --version <1.21.1|26.2|26.3> --radius <blocks>\n"
-                             "  --min-x <x> --max-x <x> --min-z <z> --max-z <z>  (exact rectangle; overrides center/radius)\n"
-                             "  --cluster-radius 128 --cluster-long <side> --cluster-short <side>\n"
-                             "  --shape circle --cluster-shape circle  (cluster-long/short select a rectangular window)\n"
-                             "  --min-structures 2 --min-spawners 20 --threads 8 --limit 0\n"
-                             "  --max-structures 0  cap the chambers counted per result (0 = unlimited);\n"
-                             "    clusters above the cap are dropped as a whole\n"
-                             "  --min-spawners is the minimum equivalent count inside the window\n"
-                             "    (fast + slow * conversion-ratio), not the fast+slow total\n"
-                             "  --conversion-ratio 1.0  (slow spawner weight; 1.0 keeps total-count ranking)\n"
-                             "  --strict-mode  structure starts must stay <strict-margin> blocks inside the window;\n"
-                             "    spawner counting still uses the full window\n"
-                             "  --strict-margin 0  inner margin used by --strict-mode\n"
-                             "  --center-x 0 --center-z 0 --output results --full-world\n"
-                             "  --chunk-x <chunk> --chunk-z <chunk>  (single chamber JSON)\n"
-                             "  --config finder.properties --checkpoint-dir results/checkpoints\n"
-                             "  --no-checkpoint --jsonl  (桌面协议 v3，stdin/stdout)\n";
+                std::cout << "试炼刷怪笼独立引擎\n"
+                             "用法: trial-spawner --seed 种子 [参数]\n"
+                             "通用: --config finder.json --version 26.3 --radius 100000 --shape circle|square\n"
+                             "      --center-x 0 --center-z 0 --threads 8 --limit 100 --output results\n"
+                             "      --radius-unit blocks|chunks --full-world --no-checkpoint\n"
+                             "      --min-x/--max-x/--min-z/--max-z 精确四至（四个同时给出，覆盖中心与半径）\n"
+                             "统计: --cluster-radius 128 --cluster-radius-unit blocks|chunks --cluster-shape circle|square\n"
+                             "      --cluster-long/--cluster-short 矩形统计窗口（同时给出，覆盖统计半径）\n"
+                             "      --min-structures 2 --min-spawners 20（窗口内最低等效笼数，非快慢总数）\n"
+                             "      --conversion-ratio 1.0 慢速笼折算比例；等效笼数=fast+slow*ratio，即排名键\n"
+                             "      --strict-mode --strict-margin 0 严格模式内缩格数；笼数仍按完整窗口统计\n"
+                             "      --max-structures 0 每组参与统计的密室数上限，0=不限制\n"
+                             "桌面: --desktop (协议v3，stdin/stdout JSONL，不读取CLI配置)\n"
+                             "开发: --chunk-x 区块X --chunk-z 区块Z；--limit 0保留旧分组榜单\n"
+                             "配置键为CLI参数名去掉--，命令行覆盖配置；输出目录由--output指定。\n";
                 return 0;
             }
             const std::vector<std::string> names = {
-                "--seed",           "--version",        "--generation",   "--radius",  "--min-x", "--max-x", "--min-z",
-                "--max-z",          "--cluster-radius", "--cluster-long", "--cluster-short", "--shape",        "--cluster-shape", "--min-structures", "--min-spawners",
-                "--threads",        "--limit",          "--conversion-ratio", "--center-x",
+                "--radius-unit",  "--cluster-radius-unit", "--seed",           "--version",
+                "--generation",   "--radius",              "--min-x",          "--max-x",
+                "--min-z",        "--max-z",               "--shape",          "--cluster-radius",
+                "--cluster-long", "--cluster-short",       "--cluster-shape",  "--min-structures",
+                "--min-spawners", "--threads",             "--limit",          "--conversion-ratio",
                 "--center-z",       "--output",         "--full-world",   "--chunk-x", "--chunk-z",        "--config",
                 "--checkpoint-dir", "--no-checkpoint",  "--strict-mode",  "--strict-margin", "--max-structures", "--finder"};
             if (std::find(names.begin(), names.end(), name) == names.end())
@@ -573,64 +587,9 @@ static int run(int argc, char **argv) {
             if (name == "--full-world" || name == "--no-checkpoint" || name == "--strict-mode")
                 args[name] = "true";
             else {
-                if (i + 1 == argc)
+                if (i + 1 == command.size())
                     throw std::invalid_argument("缺少参数值：" + name);
-                args[name] = argv[++i];
-            }
-        }
-        if (args.contains("--config")) {
-            std::ifstream file(args.at("--config"));
-            if (!file)
-                throw std::invalid_argument("无法读取配置文件");
-            const std::map<std::string, std::string> keys = {{"seed", "--seed"},
-                                                             {"minecraft-version", "--version"},
-                                                             {"search-center-x", "--center-x"},
-                                                             {"search-center-z", "--center-z"},
-                                                             {"search-radius-blocks", "--radius"},
-                                                             {"search-min-x", "--min-x"},
-                                                             {"search-max-x", "--max-x"},
-                                                             {"search-min-z", "--min-z"},
-                                                             {"search-max-z", "--max-z"},
-                                                             {"search-area-shape", "--shape"},
-                                                             {"scan-threads", "--threads"},
-                                                             {"trial-cluster-radius-blocks", "--cluster-radius"},
-                                                             {"trial-cluster-long-side", "--cluster-long"},
-                                                             {"trial-cluster-short-side", "--cluster-short"},
-                                                             {"cluster-long-side", "--cluster-long"},
-                                                             {"cluster-short-side", "--cluster-short"},
-                                                             {"trial-area-shape", "--cluster-shape"},
-                                                             {"trial-min-structures", "--min-structures"},
-                                                             {"trial-min-spawners", "--min-spawners"},
-                                                             {"trial-conversion-ratio", "--conversion-ratio"},
-                                                             {"conversion-ratio", "--conversion-ratio"},
-                                                             {"cluster-radius-blocks", "--cluster-radius"},
-                                                             {"area-shape", "--cluster-shape"},
-                                                             {"min-structures", "--min-structures"},
-                                                             {"min-spawners", "--min-spawners"},
-                                                             {"trial-strict-mode", "--strict-mode"},
-                                                             {"strict-mode", "--strict-mode"},
-                                                             {"trial-strict-margin", "--strict-margin"},
-                                                             {"strict-margin", "--strict-margin"},
-                                                             {"trial-max-structures", "--max-structures"},
-                                                             {"max-structures", "--max-structures"}};
-            for (std::string line; std::getline(file, line);) {
-                auto first = line.find_first_not_of(" \t\r\xef\xbb\xbf");
-                if (first == std::string::npos || line[first] == '#')
-                    continue;
-                auto equal = line.find('=', first);
-                if (equal == std::string::npos)
-                    continue;
-                auto name = line.substr(first, equal - first);
-                name.erase(name.find_last_not_of(" \t\r") + 1);
-                auto value = line.substr(equal + 1);
-                auto begin = value.find_first_not_of(" \t\r");
-                value = begin == std::string::npos ? "" : value.substr(begin);
-                value.erase(value.find_last_not_of(" \t\r") + 1);
-                auto mapped = keys.find(name);
-                if (mapped != keys.end() && !args.contains(mapped->second))
-                    args[mapped->second] = value;
-                if (name == "full-world" && value == "true")
-                    args["--full-world"] = "true";
+                args[name] = command[++i];
             }
         }
         if (args.contains("--finder") && args.at("--finder") != "trial-spawner")
@@ -678,27 +637,28 @@ static int run(int argc, char **argv) {
         } else {
             o.center_x = integer("--center-x", 0);
             o.center_z = integer("--center-z", 0);
-            o.radius = integer("--radius", 100000);
+            o.radius = range_units::text(text("--radius", "100000"), text("--radius-unit", "blocks"));
             o.search_square = square_shape(text("--shape", "circle"));
         }
-        o.cluster_radius = integer("--cluster-radius", 128);
         const bool has_window = args.contains("--cluster-long") || args.contains("--cluster-short");
         if (has_window) {
             if (!args.contains("--cluster-long") || !args.contains("--cluster-short"))
                 throw std::invalid_argument("矩形统计窗口需同时提供 --cluster-long/--cluster-short");
             o.cluster_rect = true;
-            o.cluster_long = integer("--cluster-long", 320);
-            o.cluster_short = integer("--cluster-short", 320);
+            o.cluster_long = range_units::text(text("--cluster-long", "320"), text("--cluster-radius-unit", "blocks"));
+            o.cluster_short = range_units::text(text("--cluster-short", "320"), text("--cluster-radius-unit", "blocks"));
             o.cluster_radius = std::max(o.cluster_long, o.cluster_short) / 2;
             o.cluster_square = false;
         } else {
+            o.cluster_radius =
+                range_units::text(text("--cluster-radius", "128"), text("--cluster-radius-unit", "blocks"));
             o.cluster_square = square_shape(text("--cluster-shape", "circle"));
         }
         o.min_structures = integer("--min-structures", 2);
         o.min_spawners = integer("--min-spawners", 20);
         o.max_structures = integer("--max-structures", 0);
         o.threads = integer("--threads", 8);
-        o.result_limit = integer("--limit", 0);
+        o.result_limit = integer("--limit", 100);
         o.conversion_ratio = real("--conversion-ratio", 1.0);
         o.strict_mode = text("--strict-mode", "false") == "true";
         o.strict_margin = integer("--strict-margin", default_strict_margin);
@@ -748,7 +708,9 @@ static int run(int argc, char **argv) {
         auto total = [&] {
             return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cli_start).count();
         };
-        std::cout << write_results(o, output, text("--output", "results"), "cli", control.paused_ms(), total).dump()
+        auto directory = text("--output", "results");
+        auto path = fs::path(std::u8string(directory.begin(), directory.end()));
+        std::cout << write_results(o, output, path, "cli", control.paused_ms(), total).dump()
                   << '\n';
         return 0;
     } catch (const std::exception &e) {
